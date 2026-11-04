@@ -1,0 +1,196 @@
+na51089 bootrom -- SRAM and data layout
+=======================================
+
+The ROM uses three RAM windows.  None is cleared or initialised at reset (no
+.data/.bss setup in start.S): every variable below is written by the boot
+path that owns it before it is read.  Paths never run concurrently, so the
+same bytes are reused (ETH frame buffers and secure-boot scratch overlap at
+0xF07D0000).  The DRAM controller is not touched by the ROM itself; DRAM is
+brought up only by the header register script (hdr_script_run).
+
+Stack
+-----
+
+  sp = 0xF07D3000, set once at 0xb4 (`ldr sp, =0xF07D3000`), SVC mode,
+  full-descending.  No other mode stack is set up (exceptions just spin).
+  The stack therefore occupies 0xF07D0620..0xF07D2FFF at most; the deepest
+  frames are hdr_script_run (0x88 B), rsa_read (0x108 B) and the nested
+  fallback chain boot_fail -> next_boot_source -> X_boot -> ... which never
+  unwinds (each failed source leaves ~0x50-0x80 B behind).
+
+0xF07C0000..0xF07CFFFF  loader SRAM
+----------------------------------
+
+  0xF07C0000  32 KiB  Loader image area.  Header sectors beyond the first
+                      512 B are assembled here (first sector copied from
+                      0xF0800200, extra sectors read to 0xF07C0200) before
+                      hdr_script_run; TFTP block n is stored at
+                      0xF07C0000 + (n-1)*512 (n <= 64, so <= 32 KiB).  The
+                      body itself goes to header+4, which for NT9856x
+                      loaders is 0xF07C0000 too (LD9856xA.bin: entry
+                      0xF07C0028).  Readers: flash_boot, sd_boot,
+                      emmc_boot, eth_boot; secure_boot_verify reads
+                      0xF07C0088 directly (header+0x88 bit29), whatever the
+                      load address.
+  0xF07C8000  4 x 2 KiB  Ethernet RX buffers, RX descriptor i -> 0xF07C8000 +
+                      i*0x800 (eth_boot; address formed as
+                      (i + 0x1E0F90) << 11)
+
+0xF07D0000..0xF07D2FFF  scratch (per boot path) + stack
+------------------------------------------------------
+
+  Ethernet (eth_boot, eth_xmit):
+  0xF07D0000  0x40   4 TX descriptors (EQOS normal format); eth_xmit uses
+                     only the first, tail pointer 0xF07D0010
+  0xF07D0040  0x40   4 RX descriptors, des3 = 0xC1000000 (OWN|IOC|BUF1V)
+                     when recycled; tail pointer 0xF07D0070
+  0xF07D0080  0x40   TX header buffer (Ethernet/IP/UDP or ARP, 0x2a B):
+                       +0x06 (0086) source MAC
+                       +0x10 (0090) IP total length (TFTP ACK: 0x0020)
+                       +0x14 (0094) ARP opcode
+                       +0x16 (0096) ARP sender MAC
+                       +0x1a (009a) IP source / +0x1c (009c) ARP sender IP
+                       +0x1e (009e) IP destination
+                       +0x20 (00a0) ARP target MAC
+                       +0x24 (00a4) UDP destination port
+                       +0x26 (00a6) UDP length / ARP target IP
+  0xF07D00C0  0x12c  TX payload: BOOTP (xid at 00c4, chaddr at 00dc,
+                     options at 01b0..01bf) or TFTP RRQ / ACK
+
+  Secure boot (secure_boot_verify, aes_cbc_decrypt, sha256):
+  0xF07D0000  0x20   decrypted digest ('A') / RSA result tail ('R'),
+                     compared with 0xF07D0060
+  0xF07D0020  0x20   copy of header+0x2e0 (stored SHA-256)
+  0xF07D0060  0x20   SHA-256 of the 32 KiB image
+  0xF07D0080  0x20   AES IV (first 16 B used; 32 B copied from header+0x1e0
+                     or +0x2c0 for 'S'; zeroed for 'A')
+  0xF07D00A0  0x10   zeroed before hashing (unused afterwards, inferred)
+  0xF07D0200  0x100  RSA modulus N (from header+0xc0)
+  0xF07D0300  0x20   RSA exponent E (from header+0x1c0)
+  0xF07D0400  0x100  RSA signature (header+0x1e0, byte-reversed)
+  0xF07D0500  0x100  RSA engine output; digest expected at 0xF07D05E0
+  0xF07D0600  0x20   SHA-256(N), compared with efuse words 0x14..0x1b ('C')
+
+  0xF07D0620..0xF07D2FFF  free / stack (grows down from 0xF07D3000)
+
+0xF07D4000..0xF07D4213  ROM globals
+-----------------------------------
+
+  addr        size  name               meaning                                   written by / read by
+  0xF07D4000  4     g_cluster_sects    FAT/exFAT sectors per cluster             fat_data_start / fat_cluster_sects
+  0xF07D4004  4     g_boot_source      current source (BS code 0..0xC)           boot_dispatch, next_boot_source / next_boot_source, prejump_restore
+  0xF07D4008  4     g_timeout          ETH: max DHCP retries ((t+1)*6);          eth_boot, usb_boot, uart_boot
+                                       USB/UART: timeout in us ((t+1)*30e6)
+  0xF07D400C  4     g_otp_tmo          t = OTP+0x50[20:18]                       eth_boot, usb_boot, uart_boot
+  0xF07D4010  4     g_saved_cg74       CG+0x74 before timer_start                timer_start / timer_stop
+  0xF07D4014  4     g_saved_tmr30      TIMER+0x30 before timer_start             timer_start / timer_stop
+
+  g_eth (eth_boot only), base 0xF07D4018:
+  0xF07D4018  4     speed              0x2000 = 100M, 0 = 10M (0x40 tested for
+                                       a 1G setting that is never stored)
+  0xF07D401C  4     duplex             0x100 = full, 0 = half
+  0xF07D4020  4     phy_addr           first MDIO address with reg1 != 0/0xffff
+  0xF07D4024  4     rnd                TRNG 0xF0680000+0xc: MAC bytes 3..5 and
+                                       the initial DHCP xid
+  0xF07D4028  8     server_mac         copied from the DHCPOFFER source MAC
+  0xF07D4030  8     own_mac            00:00:00:rnd[23:16]:rnd[15:8]:rnd[7:0]
+                                       (6 used); also MAC_ADDR0 0xF02B0300/0304
+  0xF07D4038  4     rx_idx             RX ring index 0..3
+  0xF07D403C  4     running            1 until "Dn"
+  0xF07D4040  4     state              DHCP/ARP/TFTP state 0..10 (functions.txt)
+  0xF07D4044  4     xid                DHCP transaction id, incremented per
+                                       DISCOVER/REQUEST
+  0xF07D4048  4     own_ip             yiaddr from the offer
+  0xF07D404C  4     retries            DISCOVER retries
+  0xF07D4050  4     server_ip          siaddr from the offer
+
+  g_sd (sd_boot, emmc_boot, sdio_*), base 0xF07D4054:
+  0xF07D4054  4     xfer_mode          0 = PIO, 2 = controller DMA address
+                                       (+0x110); 2 set by emmc_boot from
+                                       header+0x38 bit16
+  0xF07D4058  4     v2                 CMD8 answered (SD 2.0)
+  0xF07D405C  4     hc                 OCR bit30: block addressing
+  0xF07D4060  4     rca                CMD3 response (RCA << 16)
+
+  g_flash (flash_boot, nor_read, nand_read_page, spi_*), base 0xF07D4064:
+  0xF07D4064  4     mode               0 = PIO, 2 = DMA/RS-ECC transfer mode
+                                       (header+0x38 bit16); OR'd into SPI+0x10c
+  0xF07D406C  4     sectors            512-byte ECC sectors per page (4 / 8)
+  0xF07D4070  4     page_shift         page = 512 << n (2: 2 KiB, 3: 4 KiB;
+                                       0 for NOR)
+  0xF07D407C  4     block_shift        pages per block = 1 << 6
+  0xF07D4088  4     wide               x2 read (header+0x88 bit30)
+  0xF07D408C  4     odecc              1 = on-die ECC NAND (BS 2/6)
+  0xF07D4090  4     strap              BS passed to flash_boot
+  0xF07D4094  4     cfg                0x30 (2K) / 0x70 (4K), OR'd into SPI+0
+
+  USB (usb_boot and the USB stack):
+  0xF07D4098  4     g_usb_state        0 running, 1 WAIT_DONE received,
+                                       2 its CSW sent -> usb_boot leaves
+  0xF07D409C  4     g_usb_dl_addr      WRLOADER address (header copied from
+                                       here to 0xF0800200)
+  0xF07D40A0  0x80  g_usb_reply        small data-in buffer: sense, inquiry,
+                                       mode sense, IS_NVT (0x70210000),
+                                       ADDR_READ (addr, value)
+  0xF07D4120  0x14  g_xfer             {type: 7 reply-in / 3 download-out,
+                                       dir 0x80/0, addr, len, step}
+  0xF07D4134  4     g_sense_key
+  0xF07D4138  4     g_sense_asc
+  0xF07D413C  0x10  g_csw              "USBS", tag, residue, status
+  0xF07D414C  0x20  g_cbw              31-byte CBW ("USBC"; CB at 0xF07D415B)
+  0xF07D416C  4     g_usb_regs         = 0xFF600100 (device register base)
+
+  g_uart (uart_boot), base 0xF07D4170:
+  0xF07D4170  4     cdb_idx            words collected in the current CDB 0..4
+  0xF07D4174  4     done               set by WAIT_DONE
+  0xF07D4178  4     byte_idx           bytes in the current word 0..3
+  0xF07D417C  4     cdb_sum            16-bit check of the last CDB (0 = good)
+  0xF07D4180  4     reply_sum          IS_NVT reply checksum
+  0xF07D4184  4     dl_addr            WRLOADER address, != 0 = payload phase
+  0xF07D4188  4     dl_words           payload words received
+  0xF07D418C  4     chip_id            TOP+0xF0, sent by IS_NVT
+  0xF07D4190  4     dl_total           payload words expected
+  0xF07D4194  0x10  rx_bytes[4]        one byte per word
+  0xF07D41A4  0x10  cdb[4]             current 16-byte CDB
+  0xF07D41B4  4     dl_ptr             store pointer (= dl_addr)
+  0xF07D41B8  0x10  wrloader_cdb[4]    echoed when the payload is complete
+
+  0xF07D41D8  1     g_bot_state        BOT phase 1 CBW, 2 data-in, 3 data-out,
+                                       4 CSW, 5/6 stall/halt
+  0xF07D41DC  4     g_usb_opened       OPEN_DEVICE seen (gates 0x02/0x03/0x83)
+  g_ep0, base 0xF07D41E0:
+  0xF07D41E0  8     setup              bmRequestType, bRequest, wValue,
+                                       wIndex (41E4), wLength (41E6)
+  0xF07D41E8  4     seen_setup         first SETUP after reset handled
+  0xF07D41EC  4     result             0 none, 1 done, 2 stall
+  0xF07D41F0  4     in_len             control-IN bytes left
+  0xF07D41F4  4     in_ptr
+  0xF07D41F8  4     config             SET_CONFIGURATION value
+  0xF07D41FC  4     iface
+  0xF07D4200  4     alt
+  0xF07D4204  4     ep0_halt           SET_FEATURE(HALT) on EP0
+  0xF07D4208  4     high_speed         DEV_CTRL bit6 at the first SETUP
+  0xF07D420C  4     in_pending
+  0xF07D4210  4     init_done
+
+  0xF07D4214..  unused
+
+0xF0800000 window (second RAM; role inferred, only these bytes are used)
+-----------------------------------------------------------------------
+
+  0xF0800200  0x200  Header staging.  flash/SD/eMMC read the loader's first
+                     512-byte sector here; ETH/USB/UART copy the first 0x28
+                     bytes of the received image here.  Read back:
+                     +0x04 (0xF0800204) load address, +0x24 (0xF0800224)
+                     size, +0x38 (0xF0800238) script word.
+  0xF0800400  4      bit31 = DMA reads straight to the destination (from
+                     header+0x88 bit28); cleared by flash_boot/emmc_boot
+  0xF0800420  ~0x24  USB descriptor bounce buffer (usb_get_descriptor)
+
+Header in memory (summary; full table in bootrom.txt)
+-----------------------------------------------------
+
+  +0x00 entry  +0x04 load  +0x0c log  +0x24 size  +0x30 0xAA55  +0x34 poll reg
+  +0x38 script word  +0x3c lane base  +0x40 script  +0x88 flags
+  +0xc0 N  +0x1c0 E  +0x1e0 sig  +0x2c0 AES digest  +0x2e0 SHA-256
+  +0x300..0x7fff encrypted area

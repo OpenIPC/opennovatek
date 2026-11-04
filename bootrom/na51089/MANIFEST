@@ -1,0 +1,11 @@
+chip: na51089
+socs: nt98560 nt98561 nt98562 nt98566
+base: 0x00000000
+home: 0x80000000
+size: 32768
+sha256: 226408d7d3fabcb2be145b1cd036ac1154bf07346bf8651a3665b4672d32eb19
+first16: 18 f0 9f e5 18 f0 9f e5 18 f0 9f e5 18 f0 9f e5
+tag_at_7ff4: REAL
+dump_tool: busybox devmem over SSH (bootrom/scripts/dump.sh)
+dump_date: 2026-11-04
+dumped_from: NT98566 (XM board, SC501AI), OpenIPC nightly 2026-10-21

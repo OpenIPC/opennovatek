@@ -1,0 +1,5 @@
+# Vendor mask-ROM dumps and their disassembly stay local: see bootrom/README
+bootrom/*/bootrom.bin
+bootrom/*/disasm.txt
+*.o
+*.elf

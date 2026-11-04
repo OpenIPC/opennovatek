@@ -1,0 +1,310 @@
+na51089 bootrom -- MMIO registers touched by the ROM
+=====================================================
+
+Every block and offset the ROM reads or writes, grouped by block, with what
+the code does there.  Offsets were collected by literal/base tracking over the
+whole image and checked by hand against the listing.  Block names: the ones
+the task brief and Novatek sources use where known; (inferred) where the
+identity comes only from how the ROM uses the block.  This is the input for
+re/regmap-*.h: one header per block, only the offsets below.
+
+Access: r read, w write, rmw read-modify-write, p poll, W1C write-1-to-clear.
+
+TOP  0xF0010000  -- system top: boot straps, pinmux, chip id
+------------------------------------------------------------
+  +0x000  r    [3:0] BS boot source strap (reset, eth, emmc, wdt)
+               [9:8] Ethernet PHY mode: 0 internal ('E'), 1 RMII refclk
+                     output ('O'), 2 RMII refclk input ('I')
+               bit12 BST[12]: set -> no watchdog for internal storage ('W')
+  +0x004  rmw  pinmux: flash (&0x110000)|0x2000; SD |0x4000; eMMC
+               |0x20000 (4-bit) / |0x80020000 (8-bit)
+  +0x014  rmw  ETH RMII: |0x40000000, then |4
+  +0x018  rmw  ETH RMII: = old|0x10000000; internal PHY after autoneg:
+               [14:13] = 2
+  +0x020  rmw  |0x10000 when an SPI read uses DMA (nor_read, flash_boot)
+               (inferred: DMA/bus select)
+  +0x0a0  w    pin function vs GPIO: flash 0xfffffaf0, SD 0xfffe07ff,
+               eMMC 0xfffffcf0 (4-bit) / 0xfffffc00 (8-bit)
+  +0x0d0  rmw  internal PHY: clear bits 6:5
+  +0x0e8  w    ETH RMII: 0x40
+  +0x0f0  r    chip id (UART IS_NVT reply; also a dummy read in eth_boot)
+  0xF0011000 +0x000 rmw  bit25 cleared around the RSA run, set after
+               (inferred: crypto bus/protection control)
+
+CG  0xF0020000  -- clock generator / reset
+------------------------------------------
+  +0x000  rmw  bit3 cleared by hdr_script_run; bit6 set by eth_boot
+  +0x004  p    bit6 polled by eth_boot (PLL lock, inferred)
+  +0x018  rmw  reset: clear bit26
+  +0x020  rmw  SD: clear [5:4]; prejump: = 0x00010000
+  +0x024  rmw  eMMC: clear [1:0]; prejump: = 0x00000f00
+  +0x03c  rmw  SDIO1 clock divider [10:0]: 0x1e9 identify, 7 transfer;
+               prejump: = 0x01f001f0
+  +0x040  rmw  [17:12] SPI clock divider (0x27, or header[29:24]);
+               [10:0] SDIO3 divider (0xf, or header[31:24]);
+               prejump: = 0x1303f1f0
+  +0x070  rmw  bit16 set at reset; bit23 AES clock (set/cleared around the
+               decrypt)
+  +0x074  rmw  clock enables: bit0 SPI (also toggled to reset its FIFO),
+               bit2 SDIO1, bit10 UART0, bit14 SDIO3, bit17 WDT, bit18 TIMER,
+               bit29 ETH.  Saved/restored by timer_start/timer_stop
+  +0x078  rmw  clock enables 2: bit24 ETH, bit25+bit28 TRNG, bit26 RSA,
+               bit27 HASH
+  +0x084  rmw  resets: bit29 ETH (pulse); prejump pulses 0x20004005 (bits
+               0 SPI, 2 SDIO1, 14 SDIO3, 29 ETH)
+  +0x088  rmw  reset 2: bit25 TRNG (pulse)
+
+PAD  0xF0030000  -- pad drive/pull (inferred)
+---------------------------------------------
+  +0x040  w    flash: 0; prejump: 0x00010000
+  +0x068  w    SD: 0x01000000 identify, 0x01111112 transfer; prejump
+               0x01000001
+  +0x098  rmw  ETH RMII refclk output: |0x400; prejump: = 0x00100000
+
+TIMER  0xF0040000
+-----------------
+  +0x030  rmw  bit16 enable (reset, timer_start; restored by timer_stop)
+  +0x100  w    = 3 at reset (clock/prescale select, inferred)
+  +0x110  w/p  counter control: 1 = (re)start from 0, 0 = stop (poll 0)
+  +0x118  r    counter, 1 us per tick (inferred from the 1/4/5/30 s
+               constants and the hardware capture timing)
+
+WDT  0xF0050000
+---------------
+  +0x000  w    control, key 0x5A96 in [31:16]: 0x5A960F00 = disable
+               (next_boot_source); 0x5A961042 then |0x5A960001 = arm
+               (wdt_arm_or_skip); timeout field presumably [15:8] (inferred)
+  +0x080  r    [15:8] watchdog reset count/flag ('J', 100 ms flash reset)
+
+UNKNOWN  0xF0060000
+-------------------
+  +0x018  w    = 1 once at reset (block not identified)
+
+GPIO  0xF0070000
+----------------
+  +0x020  w    direction bank 0: pin9 (NOR reset, OTP bit9) / pin10 (eMMC)
+               output, then 0 (input)
+  +0x040  w    set bank 0 (pin high)
+  +0x060  w    clear bank 0 (pin low)
+  +0x03c  w    direction, 8th word of the group (bank 7 if one word per
+               bank, inferred): bit6 = external RMII PHY reset
+  +0x05c  w    set, same bank, bit6
+  +0x07c  w    clear, same bank, bit6
+               sequence (RMII 'O'/'I' only): low 200 ms, high 20 ms, low
+               20 ms, high, 200 ms
+
+UART0  0xF0290000  -- 16550-style, 4-byte register stride
+---------------------------------------------------------
+  +0x000  w/r  THR (every console letter, many written with no FIFO check)
+               / RBR / DLL (= 13, or |= 0x0d in uart0_reinit)
+  +0x004  w    DLM = 0
+  +0x008  w/p  FCR = 7 (enable + reset FIFOs); read: bit4 polled before
+               uart0_putc/put32 (TX FIFO full, inferred)
+  +0x00c  rmw  LCR: bit7 DLAB, [1:0] = 3 (8N1)
+  +0x014  r    LSR: bit0 data ready (uart_boot), bit5 THRE (debug_msg)
+
+UART1  0xF0300000
+-----------------
+  +0x000  w    THR: '.' every 256 payload words during UART download
+  +0x01c  r    SCR used as a debug switch by lzma_inflate: bit0 print
+               arguments, bit1 print the LZMA header fields
+
+SPI  0xF0400000  -- SPI NOR/NAND controller
+-------------------------------------------
+  +0x000  rmw  [3:0] mode (spi_mode); NOR = 0x00180001; NAND = cfg |
+               0x00080305 (on-die ECC) or | 0x00080a05 (RS ECC), cfg 0x30
+               (2K) / 0x70 (4K)
+  +0x008  rmw  bit3 cleared when OTP bit4 (clock from pad, 'D'); bit0 =
+               reset, polled clear (1 s -> K:)
+  +0x014  rmw  bit4 chip select, [1:0] bus mode, [11:9] x2 data (0xa00),
+               bit11 set for NAND
+  +0x020  rmw  control: low byte = sequence type (0x07, 0x0b, 0x0c, 0x16,
+               0x18, 0x1d, 0x1e ...), bit12 go, bit13 always set by
+               spi_xfer_setup, bit15 soft reset (poll clear, 1 s -> K:)
+  +0x024  w    = 0x551 (timing)
+  +0x028  rmw  bit0/bit1 set around spare/ECC register reads
+  +0x034  w    opcode word (bytes packed, e.g. 0x03c00f13)
+  +0x038  w    row (page) address
+  +0x03c  w    column / NOR byte address
+  +0x048  p/W1C status: bit4 feature byte valid, bit12 done, bit13 -> 2
+               (ECC error), bit16 -> 4; cleared with 0x17000
+  +0x054  rmw  bit0 enable; bit4 FIFO reset, polled
+  +0x058  r    hardware 16-bit checksum of the data read
+  +0x060  w    DMA destination
+  +0x064  w    bit31 DMA enable (0 to stop)
+  +0x070  r    per-sector ECC status (nand_read_page)
+  +0x080  r    per-sector ECC status, 2 bits each (flash_boot)
+  +0x0b4  w    = 0xc00f, +0x0bc = 0x100 (status/feature polling setup)
+  +0x0c0  w    = 7 (dummy cycles for the x2 read)
+  +0x100  r    data FIFO
+  +0x104  w    transfer length
+  +0x108  r    FIFO status, bit8 = empty
+  +0x10c  w    FIFO/DMA mode = g_flash.mode | 1
+  +0x200  r    spare byte 0 (bad-block marker, on-die ECC parts)
+  +0x204  r    spare byte 1 (RS parts) ; also 5 dummy reads (spi_settle)
+  +0x3fc+16i, +0x400+16i, +0x404+16i  r  RS ECC error locations per
+               sector: [11:0] byte, [15:12] bit / byte masks (XOR fix-up)
+
+SDIO1  0xF0420000  /  SDIO3  0xF0510000  -- same controller, SD / eMMC
+----------------------------------------------------------------------
+  +0x000  rmw  command: [7:0] index | 0x40 short resp | 0x80 long resp,
+               0x200 start, 0x800 busy; bit10 reset/power (poll clear,
+               1 s -> K:); eMMC: 0x14000 boot config, |0x2000 boot request,
+               0 = end boot
+  +0x004  w    argument
+  +0x008..0x014 r  response words 0..3
+  +0x01c  w    = 0x02000240 (data timeout / block config, inferred)
+  +0x020  w    = 0x04000000 (data control)
+  +0x028  p/W1C status: [3:0] errors, [7:4] done (0x40 cmd, 0x15/0xaa
+               data), bit15 boot ack, bit16/18 boot errors, bit17 boot
+               end; written ~0 to clear all
+  +0x038  w    = 0x400 then 0 (clock/power gating around setup)
+  +0x03c  w    bus width: 1 = 4-bit, 2 = 8-bit
+  +0x048  w    eMMC: = 0x00100000 (boot mode)
+  +0x04c  rw/p bit0 reset (= 1, poll clear, 1 s -> K:)
+  +0x050  rmw  bit12: set unless OTP says otherwise (SD bit11 'F', eMMC
+               bit14 'R') -- sampling option (inferred)
+  +0x068  rmw  bit0 enable; bit4 FIFO reset, polled
+  +0x06c  r    hardware 16-bit checksum of the data read
+  +0x070  w    DMA destination (0xF0800400 bit31 mode)
+  +0x074  w    = 0x80000000 DMA start, 0 stop
+  +0x100  r    data FIFO
+  +0x104  w    transfer length
+  +0x108  r    FIFO level [5:0], bit9 = 16 words ready
+  +0x10c  w    = 1, or 3 when g_sd.xfer_mode == 2
+  +0x110  w    DMA address (xfer_mode 2)
+  +0x1fc  w    = 1 before every command (inferred: clear/arm)
+
+ETH  0xF02B0000  -- Synopsys DWC Ethernet QoS (EQOS) MAC
+--------------------------------------------------------
+  +0x000  w    MAC_Configuration = 0x08040003 | 0x2000 (full duplex) |
+               0xc000 (100M) / 0x8000 (10M)
+  +0x070  w    = 2 (MAC_Q0_Tx_Flow_Ctrl)
+  +0x090  w    = 1 (MAC_Rx_Flow_Ctrl)
+  +0x200  rw/p MAC_MDIO_Address: phy<<21 | reg<<16 | 0xd read / 5 write,
+               bit0 busy
+  +0x204  rw   MAC_MDIO_Data
+  +0x300  w    MAC_Address0_High (MAC bytes 4,5)
+  +0x304  w    MAC_Address0_Low (bytes 0..3)
+  +0xd00  w    MTL_TxQ0_Operation_Mode = 2 (TSF)
+  +0xd30  w    MTL_RxQ0_Operation_Mode = 0x23
+  DMA 0xF02B1000:
+  +0x000  w/p  DMA_Mode: bit0 SWR (poll clear, 1 s -> K8)
+  +0x00c  r    DMA_Debug_Status0: [15:12] TX process state (eth_xmit)
+  +0x104  rmw  DMA_CH0_Tx_Control = 0x00100010 (PBL 16, OSF); bit0 ST
+  +0x108  rmw  DMA_CH0_Rx_Control: [14:1] RBSZ = 2048 (field written as
+               0x1000), [21:16] RxPBL = 16, bit0 SR (start)
+  +0x114  w    DMA_CH0_TxDesc_List_Address = 0xF07D0000
+  +0x11c  w    DMA_CH0_RxDesc_List_Address = 0xF07D0040
+  +0x120  w    DMA_CH0_TxDesc_Tail_Pointer
+  +0x128  w    DMA_CH0_RxDesc_Tail_Pointer
+  +0x12c  w    DMA_CH0_TxDesc_Ring_Length = 3
+  +0x130  w    DMA_CH0_RxDesc_Ring_Length = 3
+  +0x160  rw   DMA_CH0_Status: bit0 TI, bit6 RI (W1C)
+  Glue / internal PHY 0xF02B3000 (Novatek-specific):
+  +0x004  rmw  bit31 cleared, bit4 set (RMII) / cleared (internal PHY)
+  +0x00c  w    = 0x312 (internal PHY)
+  +0x014  rmw  bit0 RMII refclk direction (clear 'O', set 'I'), bit4 ('O'),
+               bit5 set last
+  +0x800  w    = 2, then 8 (PHY power-up sequence)
+  +0x89c, +0x8c8 (bits 0,1), +0x8cc, +0xae8  rmw  bit0 cleared
+  +0x8dc  rmw  bit0 set
+  +0x8f8  rmw  |= 0x80
+  +0x900  w    = 0x40
+  +0xa84  w    = 0xc9;  +0xa88 = 0x53;  +0xa8c = 7
+  Other:
+  0xF0FF0020  rmw  bit0 cleared before RX starts, set before the loader
+               check (eth_boot only; block not identified)
+
+AES  0xF0620000
+---------------
+  +0x000  w/p  = 1 reset (poll bit0 clear), = 0x122 decrypt mode (AES-128,
+               inferred)
+  +0x004  w    = 1 start
+  +0x00c  p/W1C bit0 done
+  +0x030..0x03c  rw  input block (read back as the next CBC IV)
+  +0x040..0x04c  r   output block
+
+OTP  0xF0660000  -- efuse
+-------------------------
+  +0x004  w    word index (0..31)
+  +0x008  r    read data
+  +0x020  rw   control: bit0 enable, bit4 read start
+  +0x030  p    status: bit0 ready, bit1 data valid
+  +0x040  w    key-path select a (efuse_key_select)
+  +0x044  w    key-path select b
+  +0x050  r    boot configuration word:
+               bit1 RSA (else AES)       bit3 check SHA-256(N) vs efuse 0x14..
+               bit4 SPI clock from pad   bit5 secure boot ('X')
+               bit6 skip NOR 'p' step    bit7 encrypted area ('S')
+               bit8 10 ms delay          bit9 NOR reset pulse on GPIO9
+               bit11 SD option ('F')     bit14 eMMC option ('R')
+               [20:18] timeout multiplier t: DHCP retries (t+1)*6, USB/UART
+               (t+1)*30 s
+  efuse words used: 0x10..0x13 AES key (pushed to the engine), 0x14..0x1b
+  SHA-256 of the RSA modulus, any word as DRAM trim (script op 8)
+
+HASH  0xF0670000
+----------------
+  +0x000  w    = 0x00100012 (SHA-256 mode, inferred)
+  +0x00c  p/W1C bit0 block done
+  +0x070..0x08c  r  digest
+  +0x090  w    data in (16 words per block)
+
+TRNG  0xF0680000  (inferred: the value differs on every boot)
+------------------------------------------------------------
+  +0x000  rmw  |= 0x300 (enable)
+  +0x00c  r    random word -> MAC 00:00:00:xx:xx:xx and DHCP xid
+
+RSA  0xF06A0000
+---------------
+  +0x000  w    = 6 (mode)
+  +0x004  w    = 1 start
+  +0x00c  p    bit1 then bit0 (busy/done), 10 s / 1 s timeouts -> K:
+  +0x010  w    N data port (+0x014 index reset)
+  +0x018  w    E data port (+0x01c index reset)
+  +0x020  rw   message in / result out (+0x024 index reset)
+
+DDR  0xC0001000 / 0xC0021000  (only through hdr_script_run)
+-----------------------------------------------------------
+  0xC000130C  w   training command (script op 7)
+  0xC0001310  p   training status
+  0xC0021000 + (w0[11:0] << 2)  w  PHY lane registers (script op 6)
+  Ops 0/1/3/4/5 write arbitrary addresses supplied by the header.
+
+USB  0xFF600000  -- Faraday FOTG210-style OTG, device registers at +0x100
+------------------------------------------------------------------------
+  0xFF600400  rmw  |= bit21 at start, |= 0x300000 after init (OTG/PHY
+                   control, inferred)
+  Device block, base g_usb_regs = 0xFF600100 (offsets below are from it):
+  +0x000  rmw  DEV_CTRL: bit0 remote wakeup, bit2 GLINT_EN, bit4 SFRST
+               (poll clear), bit5 CHIP_EN, bit6 HS status, bit9 FORCE_FS
+               (BS 0xB)
+  +0x004  rw   DEV_ADDR: [6:0] address, bit7 configured
+  +0x008  rmw  bit0 set at init
+  +0x010  w    0x44c (HS) / 0x2710 (FS) after SET_CONFIGURATION (SOF
+               mask timer, inferred)
+  +0x014  rmw  bit0 cleared at init, set by usb_bot_halt
+  +0x020  rmw  CX FIFO control: bit0 done, bit2 stall, bit3 clear FIFO;
+               [9:8] polled == 3
+  +0x030  r    group interrupt mask
+  +0x034  r    group 0 mask
+  +0x038  w    group 1 mask (bulk FIFO OUT bits 4/5, IN bit16)
+  +0x03c  w    group 2 mask (= 0x600)
+  +0x040  r    group interrupt status
+  +0x044  rw   group 0 status: setup, EP0 in/out, status, stall, abort
+  +0x048  r    group 1 status: FIFO OUT/IN
+  +0x04c  rw   group 2 status: bit7 DMA done, bits1-2/8 DMA errors, reset/
+               suspend/resume (W1C)
+  +0x050, +0x054 rw  read and written back (W1C of status words)
+  +0x060..0x07c rmw IN EP1..8: max packet, bit11 stall, bit12 reset toggle
+  +0x080..0x09c rmw OUT EP1..8: same (EP2 OUT at +0x084)
+  +0x0a0..0x0a7 rw  EP -> FIFO map (byte per EP)
+  +0x0a8..0x0ab w   FIFO -> EP map
+  +0x0ac..0x0af rw  FIFO config (bit5 enable)
+  +0x0b8  r    FIFO byte count of the bulk OUT FIFO
+  +0x0c0  w    DMA target FIFO: 1 FIFO0, 4 FIFO2, 0x10000 CX
+  +0x0c8  rmw  DMA control: len<<8 | 2 (read from host) | 1 start; bit5
+               pulsed at usb_boot start (0xFF6001C8)
+  +0x0cc  w    DMA address
+  +0x0d0  r    setup packet port (read twice: 8 bytes)

@@ -1,0 +1,45 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Compile-gate for the reconstructed bootrom source: re.elf must build
+  # warning-free and define exactly the functions listed in
+  # .expected-symbols. Not a flashable-image check, see bootrom/README.
+  bootrom:
+    name: bootrom ${{ matrix.die }} compile-gate
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        die: [na51089]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi
+
+      - name: Build bootrom/${{ matrix.die }}/re
+        run: |
+          make -C bootrom/${{ matrix.die }} build
+          test -f bootrom/${{ matrix.die }}/re.elf
+
+      # Drift either way fails; updating .expected-symbols is a deliberate,
+      # reviewable act. Compiler clones (.part.N, .constprop.N, .isra.N,
+      # .cold) are dropped: they differ between gcc versions.
+      - name: Check the symbol set
+        run: |
+          arm-none-eabi-objdump -t bootrom/${{ matrix.die }}/re.elf \
+              | grep ' F ' | awk '{ print $NF }' \
+              | grep -v '\.part\.\|\.constprop\.\|\.isra\.\|\.cold' \
+              | LC_ALL=C sort -u > /tmp/actual-symbols
+          diff -u bootrom/${{ matrix.die }}/.expected-symbols /tmp/actual-symbols
+          echo "ok: $(wc -l < /tmp/actual-symbols) functions"
+
+      - name: Scripts parse
+        run: for s in bootrom/scripts/*.sh; do sh -n "$s"; done

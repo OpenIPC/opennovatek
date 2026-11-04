@@ -1,0 +1,116 @@
+bootrom — auditable reverse-engineering of Novatek mask-ROMs
+=============================================================
+
+This tree reconstructs the on-chip mask-ROM of each supported die into
+reviewable C and ARM assembly, mirroring OpenIPC/openhisilicon's bootrom/.
+The ROM is what runs before any flash code: it picks a boot source from the
+strap pins, falls back from a missing loader through SD, Ethernet, USB and
+UART, checks the loader it finds and jumps to it. Knowing exactly what it
+does is what makes a bricked camera recoverable.
+
+Per-die layout:
+
+  bootrom/<die>/
+    MANIFEST                  tracked: SoCs, run and home address, dump
+                              size, sha256, first 16 bytes, how it was dumped
+    Makefile                  disasm | build | verify | clean
+    .expected-symbols         the functions re.elf must define (CI gate)
+    re/                       clean-room reverse-engineered source
+      <die>-regmap.h          umbrella header
+      regmap-*.h              per-block register offsets, only what's used
+      start.S                 reset vectors, CPU setup, stack, the
+                              exported-routine table the loaders call
+      *.c                     C bodies, one file per subsystem
+      re.lds                  links at the address the ROM runs at
+    scratchpad/               human-readable analysis notes
+      bootrom.txt             hex + mnemonic + commentary (vector page)
+      functions.txt           function ledger: address, name, signature
+      sram.txt                SRAM and global data the ROM uses
+      regmap.txt              every MMIO register the ROM touches
+      split.txt               which ledger functions live in which file
+
+The raw .bin and the disassembler output stay local — see .gitignore. Each
+contributor reproduces them with scripts/dump.sh and scripts/disasm.sh.
+
+Supported dies
+--------------
+
+  na51089   NT98560, NT98561, NT98562, NT98566   32 KiB, runs at 0,
+                                                 home 0x80000000
+
+Workflow
+--------
+
+  # 1. Dump the mask-ROM from a live camera: root SSH and busybox devmem.
+  #    It is read a word at a time from its home address.
+  bootrom/scripts/dump.sh <camera> na51089
+
+  # 2. Verify the local dump matches the tracked MANIFEST.
+  bootrom/scripts/verify.sh na51089
+
+  # 3. Produce a disassembly (local-only) at the address the ROM runs at.
+  bootrom/scripts/disasm.sh na51089
+
+  # 4. Sanity-build the reconstructed source; it must compile cleanly under
+  #    arm-none-eabi-gcc with -nostdlib -ffreestanding.
+  make -C bootrom/na51089 build
+
+The build target produces re.elf. It is NOT a byte-identical
+reconstruction: matching the original image would need Novatek's exact
+compiler and flags. It is a well-formedness gate, and a record of the
+behaviour, function by function, with the addresses in the original.
+
+How na51089 was checked
+-----------------------
+
+re.elf links to exactly 32 KiB with the exported table at 0x7FB8, as in the
+ROM. Beyond the compile gate:
+
+  start.S     linked with the C entry points at their original addresses,
+              its 0x320 bytes are identical to the ROM's 0x0000..0x031f
+  export.S    the same, for the 72-byte table at 0x7FB8..0x7FFF
+  lib.c       run side by side with the ROM's own code under qemu-arm on
+  loader.c    random inputs (20k rounds per helper; 11k random register
+              scripts for hdr_script_run, every op and branch): identical
+  lzma.c      byte-identical output on seven LZMA streams (several lc/lp/pb
+  lz.c        settings), and LZ_Uncompress on a 40 KB stream
+  usb.c       the USB descriptors and the SCSI replies are byte-identical
+  usb_msc.c   to the ROM's const data
+  net.c       the frame templates are byte-identical; the console letters
+  eth.c       match a serial capture of the Ethernet boot on an NT98562
+
+Everything else is checked by reading against the disassembly only. Each
+function carries its original address, and faithful quirks (including
+outright ROM bugs, such as memcpy8 dropping words at some alignments) are
+kept and commented. TODO(headers) marks a constant defined locally that
+belongs in a shared header.
+
+What the ROM does (na51089)
+---------------------------
+
+The NT9856x ROM code Application Note describes the boot source table and
+the letters the ROM prints on UART0 (115200 8N1); the reconstruction
+confirms and extends it:
+
+  N           ROM start
+  P D R E     SPI NOR, SPI NAND (on-die ECC), SPI NAND (RS ECC), eMMC
+  S1          SD card
+  H E/O/I     Ethernet, built-in PHY / RMII out / RMII in
+  U           USB
+  K2..K9      failures; K9 is a loader that fails the checksum
+  X A R S     secure boot: enabled, AES, RSA, encrypted data area
+  T           jump to the loader
+
+With no valid loader in flash it goes flash, SD, Ethernet, USB, UART. Once a
+DHCP server answers, the Ethernet stage waits for loader.bin over TFTP with
+no timeout, so on a network it is in practice the last source. The UART
+stage takes the write loader in 16-byte commands. re/ has the details.
+
+Running it under emulation
+--------------------------
+
+qemu-bench's NA51089 machines model this ROM's behaviour in C
+(nvt-bootrom.c), written from this reconstruction; defib recovers a blank
+emulated board through it over UART and over Ethernet. Running re.elf
+itself there, as openhisilicon's av300 ROM runs in qemu-hisilicon, is
+future work.

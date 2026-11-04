@@ -1,0 +1,196 @@
+na51089 bootrom -- proposed split of the reconstruction (re/)
+==============================================================
+
+Goal: several people reconstruct in parallel without touching the same file.
+Every ledger function (functions.txt, func_000..func_124) is assigned to
+exactly one source file below; const data goes with its only user.  The
+layout mirrors openhisilicon bootrom/hi3516av300/re (start.S + C +
+regmap-*.h + umbrella header) but splits the C by subsystem, because this
+ROM has ~7x the code of av300's.
+
+Phase 0 -- shared headers, one person, before anything else
+-----------------------------------------------------------
+Written once from the scratchpad files, then frozen (changes by PR to the
+owner only):
+
+  re/na51089-regmap.h   umbrella: includes every regmap-*.h, REG32()/REG8()
+                        accessors, block base addresses
+  re/regmap-top.h       TOP 0xF0010000 (+0x1000 for 0xF0011000)
+  re/regmap-cg.h        CG 0xF0020000 (clock-enable/reset bit names)
+  re/regmap-pad.h       PAD 0xF0030000
+  re/regmap-timer.h     TIMER 0xF0040000
+  re/regmap-wdt.h       WDT 0xF0050000 (+ the 0xF0060000 unknown word)
+  re/regmap-gpio.h      GPIO 0xF0070000
+  re/regmap-uart.h      UART0 0xF0290000, UART1 0xF0300000
+  re/regmap-spi.h       SPI flash controller 0xF0400000
+  re/regmap-sdio.h      SDIO1 0xF0420000 / SDIO3 0xF0510000 (one layout)
+  re/regmap-eqos.h      ETH MAC 0xF02B0000, DMA 0xF02B1000, glue/PHY
+                        0xF02B3000, 0xF0FF0020
+  re/regmap-crypto.h    AES 0xF0620000, HASH 0xF0670000, TRNG 0xF0680000,
+                        RSA 0xF06A0000
+  re/regmap-otp.h       OTP/efuse 0xF0660000 incl. the +0x50 boot-config bits
+  re/regmap-ddr.h       0xC0001000 / 0xC0021000 (script ops 6/7 only)
+  re/regmap-usb.h       USB 0xFF600000 / device block 0xFF600100
+  re/sram.h             every address in sram.txt: struct g_eth, g_sd,
+                        g_flash, g_uart, g_ep0, g_xfer, CBW/CSW, the
+                        0xF0800200 header staging, loader header struct
+                        (bootrom.txt), stack top
+  re/bootrom.h          prototypes of every non-static function below,
+                        boot-fail codes (K2..K10), BS strap codes, letters
+
+Phase 1 -- parallel, one owner per file
+---------------------------------------
+
+re/start.S            0x0000-0x031f, hand asm, ~200 lines
+  func_000 exc_hang, func_001 reset_handler, func_002 boot_dispatch (+ the
+  16-word table at 0x1c0), func_003 check_and_run_loader, func_004
+  run_loader, func_005 hang_reserved_strap; literal pool 0x2e4.
+  Calls out to C: uart0_init_banner, udelay, flash/sd/eth/usb/emmc/uart
+  boot entries, secure_boot_verify, prejump_restore, boot_fail.
+  Headers: regmap-top/cg/timer/wdt/gpio/otp/uart.h, sram.h
+
+re/lib.c              generic helpers, no MMIO
+  func_021 popcount, func_025 memcpy32, func_026 memset32,
+  func_042 rd8, func_043 rd32le, func_044 rd16le, func_045 wr16le,
+  func_046 wr8, func_047 memcpy8, func_050 wr32le, func_052 swap16x2
+  Headers: bootrom.h only
+
+re/timer.c
+  func_038 timer_start, func_039 timer_now, func_040 timer_stop,
+  func_041 udelay
+  Headers: regmap-cg.h, regmap-timer.h, sram.h (saved CG/TIMER words)
+
+re/boot.c             fallback chain and pre-jump cleanup
+  func_027 prejump_restore, func_029 next_boot_source, func_030 boot_fail,
+  func_032 wdt_arm_or_skip
+  Headers: regmap-cg/pad/top/wdt/otp/uart.h, sram.h
+
+re/loader.c           loader header handling and the DRAM register script
+  func_028 hdr_tag_ok, func_031 hdr_script_run
+  Headers: regmap-cg.h, regmap-ddr.h, sram.h (header struct)
+
+re/secure.c           secure boot, crypto engines, efuse
+  func_018 aes_load_efuse_key, func_019 aes_cbc_decrypt,
+  func_020 reverse256, func_033 rsa_load_n, func_034 rsa_load_e,
+  func_035 rsa_run, func_036 rsa_read, func_037 secure_boot_verify,
+  func_064 otp_boot_cfg, func_065 efuse_key_select, func_116 sha256,
+  func_117 efuse_read
+  Headers: regmap-crypto.h, regmap-otp.h, regmap-cg.h, regmap-top.h,
+  regmap-uart.h (letters X/S/R/A/C), sram.h (0xF07D0000 scratch)
+
+re/console.c          UART0 console and the exported print helpers
+  func_062 uart0_init_banner, func_066 uart0_put32, func_067 uart0_putc,
+  func_068 uart0_getc, func_069 uart0_rx_ready, func_070 uart0_reinit,
+  func_115 put_hex32, func_119 debug_msg, func_122 debug_msg_err,
+  func_123 debug_msg_var
+  Headers: regmap-uart.h, regmap-cg.h
+
+re/uart_boot.c        BS 0xC download protocol
+  func_071 uart_boot
+  Headers: regmap-uart.h, regmap-top.h (chip id), regmap-otp.h, sram.h
+
+re/eth.c              EQOS MAC/DMA/PHY bring-up
+  func_048 mdio_read, func_049 mdio_write, func_051 eth_xmit, and the
+  hardware half of func_053 eth_boot (0x2cb4..0x3404: 'H', E/O/I, PHY
+  scan, AN0/AN1, speed letters, MAC address, descriptors, 'X').  The
+  original is ONE function; reconstruct it as eth_boot() calling a static
+  eth_hw_init() here and net_run() from net.c, and note in a comment that
+  gcc inlined both.
+  Headers: regmap-eqos.h, regmap-cg.h, regmap-top.h, regmap-pad.h,
+  regmap-gpio.h, regmap-crypto.h (TRNG), regmap-uart.h, sram.h
+
+re/net.c              DHCP / ARP / TFTP state machine (second half of
+                      func_053, 0x3400..0x3e7c) + frame templates
+  data_24..data_28 (0x7a50 TFTP, 0x7a7c RRQ, 0x7a90 DHCP, 0x7abc BOOTP,
+  0x7be8 ARP); RX parse, states 0..10 (functions.txt table), copy of
+  TFTP data to 0xF07C0000, final check_and_run_loader(1, 0, 0)
+  Headers: regmap-eqos.h (DMA status/tail only), regmap-uart.h, sram.h
+
+re/sdio.c             SDIO1/SDIO3 common layer
+  func_054 sdio_wait, func_055 sdio_read_data, func_058 sdio_cmd
+  Headers: regmap-sdio.h, sram.h (g_sd.xfer_mode)
+
+re/sd.c               SD card boot (BS 1, first fallback)
+  func_022 mbr_first_lba, func_023 fat_data_start, func_024
+  fat_cluster_sects, func_059 sd_read_blocks, func_060 sd_boot
+  Headers: regmap-sdio.h, regmap-cg/pad/top/otp/uart.h, sram.h
+
+re/emmc.c             eMMC boot-partition boot (BS 8/9)
+  func_056 emmc_boot_end, func_057 emmc_boot_read, func_061 emmc_boot
+  Headers: regmap-sdio.h, regmap-cg/top/otp/uart.h, sram.h
+
+re/flash.c            SPI NOR / SPI NAND (BS 0/2/3/6/0xA)
+  func_006 spi_settle, func_007 spi_cmd, func_008 spi_wait,
+  func_009 spi_pio_read, func_010 spi_xfer_setup, func_011 spi_cs,
+  func_012 spi_bus, func_013 spi_mode, func_014 spi_wide,
+  func_015 nor_read, func_016 nand_read_page, func_017 flash_boot
+  Headers: regmap-spi.h, regmap-cg/pad/top/otp/uart.h, sram.h
+
+re/usb.c              USB device controller + chapter 9 + descriptors
+  func_080 usb_dev_hw_init, func_081 usb_init, func_082 usb_cfg_eps_hs,
+  func_083 usb_cfg_eps_fs, func_084 usb_ep0_status, func_085 usb_ep0_dma,
+  func_086 usb_ep0_tx_next, func_087 usb_reset_toggles,
+  func_088 usb_get_status, func_089 usb_clear_feature,
+  func_090 usb_set_feature, func_091 usb_set_address,
+  func_092 usb_get_descriptor, func_093 usb_get_configuration,
+  func_094 usb_set_configuration, func_095 usb_get_interface,
+  func_096 usb_set_interface, func_097 usb_ep0_in_irq,
+  func_098 usb_ep0_out_irq, func_100 usb_std_request,
+  func_101 usb_class_request, func_102 usb_setup_irq, func_103 usb_poll,
+  func_072 usb_fifo_dma
+  data_09..data_23 (strings, device/config/qualifier descriptors)
+  Headers: regmap-usb.h, sram.h
+
+re/usb_msc.c          bulk-only transport, SCSI, Novatek vendor CDBs, entry
+  func_063 usb_boot, func_073 usb_bot_rx_cbw, func_074 usb_bot_arm,
+  func_075 usb_bulk_out_irq, func_076 usb_bulk_in_irq,
+  func_077 usb_bot_reset, func_078 cdb_sum, func_079 nvt_vendor_cdb,
+  func_099 usb_bot_halt, func_104 scsi_request_sense,
+  func_105 scsi_clear_sense, func_106 scsi_clear_sense_wrap,
+  func_107 scsi_inquiry, func_108 scsi_mode_sense6,
+  func_109 scsi_invalid_opcode, func_110 scsi_no_medium,
+  func_111 usb_bot_data_in, func_112 usb_bot_data_out,
+  func_113 usb_bot_data_phase, func_114 scsi_dispatch
+  data_29..data_31 (sense / inquiry / mode-sense replies)
+  Headers: regmap-usb.h, regmap-otp.h, regmap-uart.h, sram.h
+
+re/lz.c               func_118 LZ_Uncompress            Headers: none
+re/lzma.c             func_120 rc_normalize, func_121 rc_bit,
+                      func_124 lzma_inflate, data_32 strings
+                      Headers: regmap-uart.h (UART1 SCR debug bits)
+
+re/export.S           the service table at 0x7FB8..0x7FFF (data_33,
+                      data_34): .word 0xffffffff, sha256, put_hex32, the
+                      three const-section bounds, lzma_inflate,
+                      LZ_Uncompress, debug_msg, debug_msg_var,
+                      debug_msg_err, efuse_read, memcpy32, put_hex32,
+                      0xffffffff, "REAL", 0, 0x116
+                      Needs a linker script that pins .export at 0x7FB8
+                      and places the const sections so 0x7FC4..0x7FCC
+                      can be emitted as symbols (__rodata_start etc.).
+
+re/link.ld            text at 0, const after it, .export at 0x7FB8, fill
+                      0xFF; owner: whoever owns export.S
+
+Ownership hot spots (agree before starting)
+-------------------------------------------
+  * eth.c / net.c share one original function: agree the eth_hw_init /
+    net_run interface (both static to the pair, or a shared eth.h).
+  * check_and_run_loader is called with (fatal, hwsum_valid, hwsum) by six
+    files; the hwsum convention (controller sum + n(n-1)/2, uint16) is
+    computed by each caller -- keep that in the callers, not in start.S.
+  * sram.h is the only place SRAM addresses appear; no file hard-codes
+    0xF07Dxxxx itself.
+  * Letters are printed by raw THR stores in most places (no FIFO wait) and
+    by uart0_putc in uart_boot -- keep each call site's flavour, it is
+    visible on the wire.
+
+Suggested order of verification (QEMU / hardware)
+-------------------------------------------------
+  1. start.S + lib + timer + console + boot: "N", strap dispatch, "K"
+     codes and the fallback chain with every source failing.
+  2. flash.c + loader.c (NOR first): "NP?I/D" then "T" with a real loader.
+  3. net.c/eth.c against the captured serial log quoted in functions.txt
+     and a DHCP/TFTP host that serves loader.bin.
+  4. uart_boot.c against an existing host-side NVT UART download client.
+  5. usb, sd, emmc, secure last (need hardware or new QEMU models).

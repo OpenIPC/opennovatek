@@ -1,0 +1,678 @@
+na51089 bootrom -- function ledger
+===================================
+
+NT98560/561/562/566 (NA51089) mask ROM, 32 KiB, linked at 0x00000000 (home
+alias 0x80000000).  All code is ARM (A32); there are no Thumb functions (see
+bootrom.txt).  0x0000..0x031f is hand-written assembly (start.S); everything
+from 0x0320 is gcc output with frame pointers.
+
+Format: func_NN  <addr>  name(signature)  notes  [callers]
+func_NN is the index in address order.  Callers are the containing functions
+of every `bl`/tail `b` that reaches the entry ("dispatch" = via the 0x1c0
+jump table).  Addresses are the first instruction.  (inferred) marks
+behaviour read from the code but not confirmed on hardware or by a second
+source.  Letters printed on UART0 are quoted 'X'.
+
+Global names used below are defined in sram.txt (g_boot_source, g_flash,
+g_sd_*, g_usb_*, g_bot_state, g_sense, ...).  MMIO block names (TOP, CG,
+PAD, TIMER, WDT, GPIO, OTP, SPI, SDIO1, SDIO3, ETH, USB, ...) are defined in
+regmap.txt.
+
+
+Startup and utilities (start.S + lib)
+-------------------------------------
+
+func_000  0x003c  exc_hang()
+          six one-instruction `b .` stubs at 0x3c/0x40/0x44/0x48/0x4c/0x50 for undef/swi/pabt/dabt/irq/fiq; ROM never enables IRQ/FIQ
+          [callers: vectors]
+
+func_001  0x0054  reset_handler()
+          [asm] SVC + I/F masked; SCTLR &= ~(I|C|A|M); CG+0x74 |= bit18, TIMER+0x30 |= bit16, TIMER+0x100 = 3; *(0xF0060018) = 1; sp = 0xF07D3000; CG+0x70 |= bit16, CG+0x18 &= ~bit26; uart0_init_banner ("N"); optional flash reset pulse on GPIO9 (BS=0, OTP+0x50 bit9) or GPIO10 (BS=8/9): dir out, low, [100 ms if WDT+0x80[15:8] != 0] + 1 ms, high, 1 ms, input; falls into boot_dispatch
+          [callers: reset vector]
+
+func_021  0x14fc  popcount(u32 x)
+          Kernighan bit count; flash_boot uses it on the NAND spare/bad-block marker word (> 6 ones = good block)
+          [callers: flash_boot]
+
+func_025  0x16e8  memcpy32(void *dst, const void *src, u32 n)
+          word copy, n rounded down to 4; also exported at 0x7FE8.
+          [callers: flash_boot, secure_boot_verify, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot, usb_get_descriptor, scsi_request_sense, scsi_inquiry, scsi_mode_sense6]
+
+func_026  0x1714  memset32(void *dst, u8 c, u32 n)
+          word fill with c replicated, n rounded down to 4.
+          [callers: secure_boot_verify, eth_xmit, eth_boot, sha256]
+
+func_038  0x277c  timer_start()
+          save CG+0x74 -> 0xF07D4010, CG+0x74 |= bit18; save TIMER+0x30 -> 0xF07D4014, |= bit16; TIMER+0x110 = 1 (counter restarts from 0). All timeouts are "elapsed since timer_start"
+          [callers: flash_boot, rsa_run, udelay, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot]
+
+func_039  0x27c4  u32 timer_now()
+          return TIMER+0x118 (free-running up-counter, 1 MHz assumed: 0xF423F = 1 s, 0x3D08FF = 4 s, 0x4C4B40 = 5 s, 0x1C9C380 = 30 s)
+          [callers: flash_boot, rsa_run, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot]
+
+func_040  0x27dc  timer_stop()
+          TIMER+0x110 = 0, wait until it reads 0; restore TIMER+0x30 and CG+0x74 from 0xF07D4014/0xF07D4010
+          [callers: flash_boot, rsa_run, udelay, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot, nvt_vendor_cdb]
+
+func_041  0x2824  udelay(u32 us)
+          timer_start; spin while timer_now() < us; timer_stop.
+          [callers: reset_handler, flash_boot, hdr_script_run, wdt_arm_or_skip, eth_boot, emmc_boot_read, sd_read_blocks, sd_boot, emmc_boot, usb_boot]
+
+func_042  0x284c  u8 rd8(const void *p)
+          byte load done as aligned word load + shift (unaligned-safe on device memory)
+          [callers: rd32le, rd16le]
+
+func_043  0x2870  u32 rd32le(const void *p)
+          4 x rd8, little-endian; eth_boot follows it with `rev` for network order
+          [callers: eth_boot]
+
+func_044  0x28b8  u16 rd16le(const void *p)
+          2 x rd8
+          [callers: eth_boot]
+
+func_045  0x28e0  wr16le(void *p, u16 v)
+          two read-modify-write byte stores
+          [callers: eth_boot]
+
+func_046  0x292c  wr8(void *p, u8 v)
+          aligned-word read-modify-write byte store
+          [callers: eth_boot]
+
+func_047  0x295c  memcpy8(void *dst, const void *src, u32 n)
+          unaligned memcpy built from word loads/stores and shifts (used for all packet field copies)
+          [callers: eth_boot]
+
+func_050  0x2b14  wr32le(void *p, u32 v)
+          unaligned word store (byte RMW when p&3)
+          [callers: eth_boot]
+
+func_052  0x2c84  u32 swap16x2(u32 x)
+          swaps the bytes inside each halfword (htons on a value from rd16le)
+          [callers: eth_boot]
+
+
+Boot dispatch and fallback
+--------------------------
+
+func_002  0x01a4  boot_dispatch()
+          [asm label inside reset_handler] g_boot_source(0xF07D4004) = TOP+0[3:0]; `ldr pc,[0x1c0 + 4*BS]` (jump, lr not set); table at 0x1c0
+          [callers: reset_handler (fall-through)]
+
+func_005  0x02dc  hang_reserved_strap()
+          [asm] `b .` for BS = 7, 0xD, 0xE, 0xF (prints nothing beyond "N"); 0x2d8/0x2e0 are nop padding, 0x2e4..0x31c is the start.S literal pool
+          [callers: dispatch]
+
+func_027  0x1748  prejump_restore()
+          called by run_loader. Returns at once for g_boot_source 8/9 (eMMC); otherwise puts clocks/pads back to defaults: CG+0x20=0x10000, CG+0x24=0xf00, CG+0x3c=0x01f001f0, CG+0x40=0x1303f1f0, pulse CG+0x84 bits 0,2,14,29 (resets), CG+0x74 &= ~(bit0|bit2|bit14) (SPI, SDIO1, SDIO3 clocks off), PAD+0x68=0x01000001, PAD+0x40=0x10000, PAD+0x98=0x100000
+          [callers: run_loader]
+
+func_029  0x180c  next_boot_source()
+          CG+0x74 |= bit17; WDT+0 = 0x5A960F00 (watchdog off); m = 1 << g_boot_source: m & 0x174D (BS 0,2,3,6,8,9,10,12) -> g=1 sd_boot; m & 0x820 (BS 5,11) -> g=0xC uart_boot; m & 0x10 (BS 4) -> g=5 usb_boot; else (BS 1, 7, 13+) -> g=4 eth_boot. Chain: flash/eMMC -> SD -> ETH -> USB(HS) -> UART -> SD ...
+          [callers: boot_fail, wdt_arm_or_skip]
+
+func_030  0x18b4  boot_fail(int code)
+          UART0 THR = 'K', then '0'+code (no FIFO wait) -> "K2".."K9", code 10 prints "K:"; tail: next_boot_source() (never returns). Codes: 2 SD init, 3 MBR, 4 PBR, 5 first sector/boot read, 6 bad flash strap, 7 loader read / NAND no good copy, 8 ETH DMA/PHY or header-extension read, 9 checksum/tag, 10 (":") timeout
+          [callers: run_loader, flash_boot, hdr_script_run, rsa_run, secure_boot_verify, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot]
+
+func_032  0x20b4  wdt_arm_or_skip()
+          called first by flash_boot and emmc_boot. TOP+0 bit12 (BST[12]) set: print 'W'. Clear: CG+0x74 |= bit17; if WDT+0x80[15:8] != 0 (a watchdog reset happened) print 'J' and next_boot_source() (skip internal storage); else WDT+0 = 0x5A961042 then |= 0x5A960001 (arm). Both: if OTP+0x50 bit8, udelay(10000)
+          [callers: flash_boot, emmc_boot]
+
+
+Loader check, header script
+---------------------------
+
+func_003  0x0200  check_and_run_loader(int fatal, int hwsum_valid, u32 hwsum)
+          [asm, no fp frame] load = *(0xF0800204); secure_boot_verify(load)==0 -> run_loader; hwsum_valid: (hwsum&0xffff)!=0 -> fail; else sum(h[i]+i) over *(0xF0800224)/2 halfwords at load must be 0 and *(u16*)(load+0x30)==0xAA55; fail: fatal ? boot_fail(9) : return.
+          [callers: flash_boot, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot]
+
+func_004  0x02b0  run_loader()
+          [asm tail of check_and_run_loader, also reached by bl] prejump_restore(); UART0 THR = 'T'; pc = *(u32*)load (header word 0). r4 = load address on entry
+          [callers: check_and_run_loader (b/bl), check_and_run_loader]
+
+func_028  0x17f0  int hdr_tag_ok(const u32 *script)
+          script = header+0x38: return *(u16*)(script-8) == 0xAA55 ? 0 : -1 (checks header+0x30)
+          [callers: flash_boot, sd_boot]
+
+func_031  0x18e0  hdr_script_run(const u32 *script)
+          header register script (DRAM init) run before the body is loaded. header+0x30 != 0xAA55 -> boot_fail(9). count = script[0][11:0]; entries from header+0x40, op = w0[27:24], addr = w0 & ~0x0F000000: 0 poll *addr until masked bits (w1: n=[23:20], bit i at (w1>>5i)&31, value (w1>>(24+i))&1); 1 *addr = w1; 2 udelay(w0[23:0]); 3 write bytes of w1 to addr+0/4/8/0xc; 4 issue cmd to reg at header+0x34 and poll; 5 write lane bytes of w1 to header+0x3c base regs; 6 same at 0xC0021000 (DDR PHY); 7 DQS/gate training via 0xC000130C/0xC0001310, only if script[0] bit19, log at header+0x0c (0x2..../0x3.... words, 0x70654321 end); 8 trims from efuse_read(w0&31); 9 apply trims to lane regs (clamp 0..31); 10 flag = w0 bit0. CG+0 &= ~bit3 at entry. (op semantics 4/7/9 partly inferred)
+          [callers: flash_boot, sd_boot, emmc_boot]
+
+
+Secure boot, crypto, efuse
+--------------------------
+
+func_018  0x1364  aes_load_efuse_key()
+          for k in 0..3: efuse_key_select(1, k); efuse_read(0x10+k) -- efuse words 16..19 pushed into the AES key (inferred hidden key path)
+          [callers: secure_boot_verify]
+
+func_019  0x13c0  aes_cbc_decrypt(const u8 *src, u8 *dst, int len)
+          AES engine 0xF0620000: per 16 B block +0 = 1 (reset, wait bit0 clear), +0 = 0x122 (decrypt mode), data -> +0x30..+0x3c, +4 = 1, wait +0xc bit0 (W1C); out +0x40..+0x4c XOR IV (0xF07D0080) -> dst; IV = ciphertext. Returns 0
+          [callers: secure_boot_verify]
+
+func_020  0x14b8  reverse256(const u8 *src, u8 *dst)
+          dst[255-i] = src[i] for a 256-byte block (big-endian word reads, words stored backwards); RSA signature in/out
+          [callers: secure_boot_verify]
+
+func_033  0x2158  rsa_load_n(const u32 *src, int nwords)
+          RSA 0xF06A0000: +0x14 = 0 (index), nwords to +0x10 then zero-pad to 64 words
+          [callers: secure_boot_verify]
+
+func_034  0x21d4  rsa_load_e(const u32 *src, int nwords)
+          +0x1c = 0, words to +0x18, zero-pad to 64
+          [callers: secure_boot_verify]
+
+func_035  0x2250  rsa_run(const u32 *msg, int nwords)
+          +0x24 = 0, words to +0x20, pad to 64; +4 = 1 (start); wait +0xc bit1 then bit0, each with a 10 s / 1 s timeout -> boot_fail(10)
+          [callers: secure_boot_verify]
+
+func_036  0x2338  rsa_read(u32 *dst, int nwords)
+          +0x24 = 0, read nwords from +0x20 (via a 64-entry pointer array on the stack)
+          [callers: secure_boot_verify]
+
+func_037  0x239c  int secure_boot_verify(u8 *img)
+          returns 1 if OTP+0x50 bit5 clear (secure boot off), else prints 'X' and verifies, returning 0 or ending in boot_fail(9). bit7: 'S' AES-128-CBC decrypt img+0x300..+0x8000 in place (IV = 32 B at img+0x1e0 (RSA) or +0x2c0 (AES), key from efuse 0x10..0x13). bit1: 'R' RSA-2048: N = img+0xc0, E = img+0x1c0, sig = img+0x1e0 (byte-reversed); fields zeroed, SHA-256(img, 0x8000) -> 0xF07D0060; bit3: 'C' SHA-256(N) must equal efuse words 0x14..0x1b; RSA engine result tail (0xF07D05e0) must equal the digest; if *(0xF07C0088) bit29, img+0x2e0 (zeroed) must equal a rehash. bit1 clear: 'A' AES: 32 B at img+0x2c0 decrypted with efuse key (IV 0) must equal the SHA-256. Fields restored afterwards.
+          [callers: check_and_run_loader]
+
+func_064  0x4df4  u32 otp_boot_cfg()
+          return OTP+0x50: bit1 RSA, bit3 key-hash check, bit4 SPI clock from pad ('D'/'I'), bit5 secure boot, bit6 skip NOR 'p' step, bit7 encrypted area, bit8 10 ms delay, bit9 NOR reset pulse, bit11 SD 'F', bit14 eMMC 'R', bits[20:18] timeout multiplier
+          [callers: flash_boot, wdt_arm_or_skip, secure_boot_verify, eth_boot, sd_boot, emmc_boot, usb_boot, uart_boot]
+
+func_065  0x4e0c  efuse_key_select(u32 a, u32 b)
+          OTP+0x40 = a, OTP+0x44 = b (used only by aes_load_efuse_key)
+          [callers: aes_load_efuse_key]
+
+func_116  0x6d68  sha256(const void *data, int len, u32 out[8])
+          HASH 0xF0670000, CG+0x78 |= bit27; +0 = 0x100012; 16 words per block to +0x90, wait +0xc bit0 (W1C); software padding (0x80, bit length, `rev`); digest +0x70..+0x8c -> out; clock off. Exported at 0x7FBC
+          [callers: secure_boot_verify]
+
+func_117  0x6eb4  u32 efuse_read(int idx)
+          OTP 0xF0660000: +0x20 = 1, wait +0x30 bit0; +4 = idx&31; +0x20 |= 0x10; wait +0x30 bit1; v = +8; +0x20 = 0; wait +0x30 bit0 clear. Exported at 0x7FE4..0x1b), aes_load_efuse_key
+          [callers: aes_load_efuse_key, hdr_script_run, secure_boot_verify]
+
+
+Console (UART0) and debug output
+--------------------------------
+
+func_062  0x4c68  uart0_init_banner()
+          CG+0x74 |= bit10 (UART0 clock); LCR |= DLAB; DLL = 13, DLM = 0; LCR &= ~DLAB; LCR |= 3 (8N1); FCR = 7; THR = 'N'.
+          [callers: reset_handler]
+
+func_066  0x4e28  uart0_put32(u32 w)
+          wait +0x08 bit4 clear, then 4 byte writes to THR, LSB first. NB: polls +0x08 (IIR/FCR slot) bit4, not LSR -- presumably a TX-FIFO-full flag of this UART (inferred)
+          [callers: uart_boot]
+
+func_067  0x4e68  uart0_putc(u8 c)
+          wait +0x8 bit4 clear, THR = c
+          [callers: uart_boot]
+
+func_068  0x4e8c  u8 uart0_getc()
+          spin on LSR(+0x14) bit0, return RBR
+          [callers: uart_boot]
+
+func_069  0x4ebc  int uart0_rx_ready()
+          LSR(+0x14) & 1
+          [callers: uart_boot]
+
+func_070  0x4ed8  uart0_reinit()
+          LCR |= DLAB; DLL |= 0x0d (OR, not store); LCR &= ~DLAB; LCR |= 3; FCR |= 7.
+          [callers: uart_boot]
+
+func_115  0x6d20  put_hex32(u32 v)
+          8 upper-case hex digits straight into UART0 THR (no FIFO wait). Exported twice: 0x7FC0 and 0x7FEC ("Dec2HexStr" in the loaders, but it prints hex).
+          [callers: eth_boot, debug_msg_err, debug_msg_var]
+
+func_119  0x700c  debug_msg(const char *s)
+          puts on UART0, waiting LSR bit5 (THRE) per byte. Exported at 0x7FD8
+          [callers: rc_normalize, debug_msg_err, debug_msg_var, lzma_inflate]
+
+func_122  0x7114  debug_msg_err(const char *s, u32 v)
+          debug_msg("E:"); debug_msg(s); put_hex32(v). Exported at 0x7FE0
+          [callers: lzma_inflate]
+
+func_123  0x7144  debug_msg_var(const char *s, u32 v)
+          debug_msg(s); put_hex32(v); debug_msg("\r\n"). Exported at 0x7FDC
+          [callers: lzma_inflate]
+
+
+UART download (BS 0xC)
+----------------------
+
+func_071  0x4f28  uart_boot()
+          BS 0xC or fallback. uart0_reinit; clear ctx 0xF07D4170..+0x20; timeout = (OTP[20:18]+1)*30 s; bytes -> LE words -> 16-byte CDB ring (4 words); every word is also a CDB word, even payload words (no resync). CDB sum = 8 halfwords + 0x1c, 0 = good. 0x81c0 (whole w0) IS_NVT: echo with fixed sum, then TOP+0xF0 (chip id) or 0; 0x01c0 OPEN_DEVICE: timer_stop (no more timeout), echo; lo16 0x83c0 ADDR_READ: echo, then addr(4) + *(u32*)addr(4) -- read happens even on a bad sum; 0x03c0 ADDR_WRITE: echo, *addr = val (also on a bad sum); 0x02c0 WRLOADER: addr = w0>>16 | w1<<16, words = (w1>>16 | w2<<16)/4, following words stored at addr, '.' on UART1 every 256 words, saved CDB echoed when complete; 0x82c0 WAIT_DONE: echo, leave. Bad sum: 4 zero words instead of the echo. Then memcpy32(0xF0800200, addr, 0x28); check_and_run_loader(1, 0, 0). Timeout -> boot_fail(10)
+          [callers: dispatch, next_boot_source]
+
+
+Ethernet: EQOS MAC, MDIO, DHCP/ARP/TFTP (BS 4)
+----------------------------------------------
+
+func_048  0x2a84  u16 mdio_read(int phy, int reg)
+          EQOS MDIO: wait 0xF02B0200 bit0 (GB) clear; +0x200 = phy<<21 | reg<<16 | 0xd (CR=..., GOC read, GB); wait; return +0x204 & 0xffff
+          [callers: eth_boot]
+
+func_049  0x2acc  mdio_write(int phy, int reg, u16 v)
+          +0x204 = v; +0x200 = phy<<21 | reg<<16 | 5; wait GB clear
+          [callers: eth_boot]
+
+func_051  0x2ba4  eth_xmit(int hdr_len, const void *payload, int pay_len)
+          one TX descriptor at 0xF07D0000: des0 = 0xF07D0080 (header buffer), des1 = payload, des2 = IOC | pay_len<<16 | hdr_len, des3 = OWN|FD|LD|CIC(3) | total; DMA ch0 TX tail 0xF02B1120 = 0xF07D0010; start TX (+0x1104 bit0) if DMA idle; wait +0x1160 bit0 (TI), W1C; wait OWN clear; stop TX; desc list +0x1114 = 0xF07D0000
+          [callers: eth_boot]
+
+func_053  0x2cb4  eth_boot()
+          BS 4 or fallback. 'H'; CG+0 |= bit6; TOP+0[9:8]: 0 'E' internal PHY, 1 'O' RMII refclk out (PAD+0x98 |= bit10), 2 'I' RMII refclk in (TOP+0x14/0x18/0xe8 pinmux); wait CG+4 bit6; clocks CG+0x78 bit24, +0x74 bit29, reset CG+0x84 bit29; RMII: glue 0xF02B3004/0x3014 and external PHY reset on GPIO +0x3c/+0x5c/+0x7c bit6 (200/20/20/200 ms); internal: glue +4/+0xc and PHY analog bring-up 0xF02B38xx/0xF02B3Axx; DMA SWR (0xF02B1000 bit0) 1 s -> boot_fail(8); scan PHY addr 0..31 (reg1 != 0/0xffff); reg0 = 0x8000, wait reg1 bit5 4 s else "AN0"; reg9 &= ~0x300; print reg0 old/new; reg0 = (reg0 & ~0x2040) | 0x2200; wait "AN1" (timeout -> assume 100F); print reg5; 's' + "100F"/"100H"/"10F"/"10H" from reg5 bits 8-9/7/6/5 (none: K8); TRNG 0xF0680000+0xc -> MAC 00:00:00:xx:xx:xx and xid; MAC regs +0x300/+0x304, +0x90 = 1, +0x70 = 2, MAC_CFG = 0x08040003 (|0x2000 full duplex, |0xC000 100M / |0x8000 10M); 4 TX + 4 RX descriptors, RX buffers 0xF07C8000 + i*0x800; MTL +0xd30 = 0x23, +0xd00 = 2; 'X'; udelay 0.5 s; 0xF0FF0020 &= ~1; RX start. State machine (see eth state table): per frame 'R','I',"\r\n". On "Dn": memcpy32(0xF0800200, 0xF07C0000, 0x28), 0xF0FF0020 |= 1, check_and_run_loader(1, 0, 0)
+          [callers: dispatch, next_boot_source]
+
+
+SD card, SDIO1/SDIO3 common (BS 1)
+----------------------------------
+
+func_022  0x1528  u32 mbr_first_lba(const u8 *mbr)
+          partition 0: boot flag (0x1be) & 0x7f must be 0, return LE32 at 0x1c6; else 0 (no MBR = superfloppy)
+          [callers: sd_boot]
+
+func_023  0x155c  u32 fat_data_start(const u8 *pbr)
+          "\xEBv\x90EXFAT": print 'e','x', g_cluster_sects = 1<<pbr[0x6d], return LE32(0x58) + (LE32(0x60)-1)*cluster (cluster heap = cluster 2 = first file); FAT: g_cluster_sects = pbr[0xd], FAT12/16 rsvd + nfats*fatsz + rootdir/16, FAT32 rsvd + nfats*fatsz32. Result is relative to the partition start
+          [callers: sd_boot]
+
+func_024  0x16d0  u32 fat_cluster_sects()
+          return g_cluster_sects (0xF07D4000)
+          [callers: sd_boot]
+
+func_054  0x3e80  int sdio_wait(int ctrl, u32 mask)
+          ctrl 0: SDIO1 0xF0420000, 1: SDIO3 0xF0510000; poll +0x28 & mask: bits[3:0] -> W1C, return -1; bits[7:4] -> W1C, return 0
+          [callers: sdio_read_data, sdio_cmd, sd_read_blocks]
+
+func_055  0x3ecc  int sdio_read_data(int ctrl, void *dst, int len)
+          g_sd_xfer_mode (0xF07D4054) != 0: sdio_wait(ctrl, 0xaa) (DMA/data end); else PIO from FIFO +0x100 using level +0x108[5:0] (bit9 = 16 words ready)
+          [callers: emmc_boot_read, sd_read_blocks]
+
+func_058  0x40fc  int sdio_cmd(int ctrl, u32 cmdflags, u32 arg, u32 *resp)
+          +0x1fc = 1; +4 = arg; +0 = (+0 & ~0xff) | cmdflags | 0x200; sdio_wait(0x40); flags bit7 long (+8..+0x14 -> resp[0..3]) / bit6 short (+8 -> resp[0]); returns <0 on error. cmdflags = index | 0x40 short | 0x80 long | 0x800 busy
+          [callers: sd_read_blocks, sd_boot, emmc_boot]
+
+func_059  0x4244  int sd_read_blocks(u32 lba, int n, void *dst)
+          CMD13 (0x4d) until state == tran; byte address unless g_sd_hc (0xF07D405c); +0x1fc=1, DMA addr +0x110 when mode 2, +0x20 = 0x4000000, +0x104 = n*512; CG+0x74 bit2 toggled with udelay(1); +0x10c = 1 or 3; +0x1c = 0x2000240; CMD18 (0x252); data; CMD12 (0x84c)
+          [callers: sd_boot]
+
+func_060  0x439c  sd_boot()
+          BS 1 or fallback. g_sd_xfer_mode = 0; 'S'; SDIO1 clock CG+0x74 bit2, +0x38 = 0x400, udelay 6; TOP+4/+0xa0 pinmux, PAD+0x68 = 0x1000000, CG+0x20 &= ~0x30, CG+0x3c div 0x1e9 (400 kHz, inferred); '1'; power/reset waits (+0 bit10, +0x4c bit0, 1 s -> K:); OTP bit11: SDIO+0x50 |= 0x1000 and 'F'; CMD0, CMD8 (0x1aa) -> g_sd_v2, ACMD41 loop (5 tries / 6000 polls, HCS if v2) -> g_sd_hc; CMD2, CMD3 -> g_sd_rca, CMD7, fast clock (CG+0x3c div 7, PAD+0x68 = 0x1111112), ACMD6 4-bit, CMD16 512; any failure -> boot_fail(2). Read MBR (K3), PBR (K4), scan up to 10 clusters from the first data sector for 0xAA55 at +0x30 (K5); extra header sectors (K8); hdr_script_run; copy header to load; read body (K7); check_and_run_loader(1, hdr+0x88>>31, SDIO1+0x6c + n(n-1)/2)
+          [callers: dispatch, next_boot_source]
+
+
+eMMC boot partition (BS 8/9)
+----------------------------
+
+func_056  0x3f84  emmc_boot_end()
+          SDIO3 +0 = 0 (release CMD line / end boot mode), wait +0x28 bit17
+          [callers: emmc_boot]
+
+func_057  0x3fac  int emmc_boot_read(void *dst, int cont, int len)
+          SDIO3: DMA addr +0x110 when g_sd_xfer_mode==2, +0x70 = dst when 0xF0800400 bit31; +0x20 = 0x4000000; +0x104 = len; CG+0x74 bit14 toggled around udelay(1); +0x10c = 1/3; DMA path: +0x74 = 0x80000000, +0x1c = 0x2000240, wait +0x28[7:4]; cont==0: +0 |= 0x2000 (boot request), wait +0x28 bit15 (boot ack; bits 16/18 -> -1); PIO: sdio_read_data(1, dst, len)
+          [callers: emmc_boot]
+
+func_061  0x48ec  emmc_boot()
+          BS 8/9 (dispatch only, never a fallback target). g_sd_xfer_mode = 0; 0xF0800400 = 0; 'E'; wdt_arm_or_skip; '4' (BS 8) or '8' (BS 9) and SDIO3 bus width (+0x3c = 1/2), CG+0x74 bit14, TOP+4/+0xa0 pinmux, CG+0x24 &= ~3, CG+0x40 div 0xf; OTP bit14: print 'R', else SDIO3+0x50 |= 0x1000; power/reset waits (1 s -> K:); +0 = 0x14000, +0x48 = 0x100000; CMD0 arg 0xF0F0F0F0 (GO_PRE_IDLE) else K5; boot request = CMD line held low via SDIO3+0 bit13 in emmc_boot_read; read first 512 B from the boot partition in boot mode (K5); header bit18: CG+0x40 clock from header[31:24]; extra header sectors (K8); hdr_script_run; copy header to load; read the rest; emmc_boot_end; check_and_run_loader(1, hdr+0x88>>31, SDIO3+0x6c + n(n-1)/2)
+          [callers: dispatch]
+
+
+SPI NOR / SPI NAND (BS 0/2/3/6/0xA)
+-----------------------------------
+
+func_006  0x0320  spi_settle()
+          five dummy reads of SPI+0x204 (delay after toggling +0x28 bits)
+          [callers: nand_read_page, flash_boot]
+
+func_007  0x0348  spi_cmd(u32 op)
+          SPI+0x34 = op (opcode(s) byte-packed: e.g. 0x03c00f13 = PAGE READ 0x13, GET FEATURE 0x0f @0xc0, READ CACHE 0x03), SPI+0x20 |= bit12 (go)
+          [callers: nor_read, nand_read_page, flash_boot]
+
+func_008  0x036c  int spi_wait(u32 mask)
+          poll SPI+0x48 & mask; result 2 if bit13, 4 if bit16, else 0; +0x48 = 0x17000 (W1C)
+          [callers: spi_pio_read, nor_read, nand_read_page, flash_boot]
+
+func_009  0x03b0  int spi_pio_read(u32 *dst, int want, int len)
+          if g_flash.mode: spi_wait(0x1000); else drain FIFO +0x100 while +0x108 bit8 clear, storing at most `want` bytes
+          [callers: nor_read, nand_read_page]
+
+func_010  0x0414  spi_xfer_setup(u32 ctrl, u32 r38, u32 r3c, u32 len)
+          SPI+0x38 = r38 (row), +0x3c = r3c (column/address), +0x104 = len, +0x20 = ctrl | 0x2000; for len == 8 or len > 16 << g_flash.page_shift: CG+0x74 bit0 off, +0x10c = g_flash.mode | 1, bit0 on
+          [callers: nor_read, nand_read_page, flash_boot]
+
+func_011  0x0498  spi_cs(int on)
+          SPI+0x14 bit4
+          [callers: nor_read, flash_boot]
+
+func_012  0x04c0  spi_bus(u32 a, u32 b)
+          SPI+0x14[1:0] = a | b
+          [callers: nor_read, flash_boot]
+
+func_013  0x04e8  spi_mode(u32 a, u32 b)
+          SPI+0x00[3:0] = a | b
+          [callers: nor_read, nand_read_page, flash_boot]
+
+func_014  0x0510  spi_wide(int on)
+          SPI+0x14[11:9] = on ? 0xa00 : 0 (x2 data lines)
+          [callers: nor_read, nand_read_page, flash_boot]
+
+func_015  0x0538  int nor_read(void *dst, u32 addr, u32 len)
+          cs pulse; spi_xfer_setup(0xc, 0, addr, 0); cmd 0x3b (dual output, g_flash.wide) or 0x03; spi_wait(0x1000) (error < 0 -> return); g_flash.wide: dummy setup, SPI+0xc0 = 7; data phase spi_xfer_setup(0x18, 0, 0, len); 0xF0800400 bit31: DMA (SPI+0x64 = 0x80000000, +0x60 = dst, TOP+0x20 |= bit16) else spi_pio_read; wait +0x48 bit12
+          [callers: flash_boot]
+
+func_016  0x0704  int nand_read_page(u32 row, u32 col, void *dst, u32 len)
+          spi_mode(8,1); spi_xfer_setup(0x16, col, row, 512 << page_shift); cmd 0x3bc00f13 (x2) / 0x03c00f13 with +0xbc = 0x100, +0xb4 = 0xc00f; DMA (0xF0800400) or: on-die ECC (g_flash.odecc) -> spi_pio_read; RS ECC (g_flash.mode) -> spi_wait(0x7000) == 2: per-sector status +0x70 (3 bits each) and error list +0x3fc.. -> XOR fix-ups in dst (bytes) or spare (+0x400.., col 0xfffc mask); returns 0
+          [callers: flash_boot]
+
+func_017  0x09a0  flash_boot(int strap)
+          BS 0/2/3/6/0xA. g_flash = {0}; strap 0 'P', 2/6 'D', 3/0xA 'R', other -> boot_fail(6). wdt_arm_or_skip; TOP+4/+0xa0 pinmux, PAD+0x40 = 0, CG+0x40 SPI clock div 0x27, CG+0x74 bit0; SPI soft reset (+0x20 bit15, 1 s -> K:); OTP bit4: 'D' (+8 &= ~8) else 'I'; +8 bit0 reset (1 s -> K:); +0x24 = 0x551, +0x54 |= 1. NOR: reset 0x66/0x99; OTP bit6 clear: 'p' + RDSR(0x05); +0 = 0x180001; read 512 B -> 0xF0800200; extra header sectors to 0xF07C0200; hdr_script_run; copy header to load; read body (DMA if script bit16); check_and_run_loader(1, ...). NAND: page_shift 2/3 (2K/4K), block_shift 6, odecc for strap 2/6; reset 0xff, udelay 1 ms; RS: GET/SET FEATURE 0xb0 bit4 off (on-die ECC off); for block 0..255: page 0 via nand_read_page, spare marker (+0x200/+0x204) popcount > 6, hdr_tag_ok; first copy check_and_run_loader(0, ...) (returns on failure, restores SPI clock), second copy fatal; boot_fail(7) when both copies fail; all 256 blocks empty: returns 0 (see bootrom.txt)
+          [callers: dispatch]
+
+
+USB device: FOTG210-style controller, BOT mass storage + Novatek vendor CDBs (BS 5/0xB)
+---------------------------------------------------------------------------------------
+
+func_063  0x4cd4  usb_boot(int strap)
+          BS 5/0xB or fallback (g=5). 'U'; 0xFF600400 |= bit21; DMA ctrl 0xFF6001c8 bit5 pulse (udelay 256, 64); DEV_CTRL 0xFF600100 |= bit5 (CHIP_EN), |= bit9 (FORCE_FS) for BS 0xB; usb_init; 0xFF600400 |= 0x300000; g_usb_state = 0; timeout (OTP[20:18]+1)*30 s; loop usb_poll() until g_usb_state > 1 (timeout -> boot_fail(10)); memcpy32(0xF0800200, g_usb_dl_addr, 0x28); check_and_run_loader(1, 0, 0)
+          [callers: dispatch, next_boot_source]
+
+func_072  0x53c0  int usb_fifo_dma(void *buf, u32 len, int in)
+          FOTG210 device DMA: +0xcc = buf; dsb; +0xc0 = FIFO (in ? 4 : 1); +0xc8 = len<<8 | (out ? 2 : 0) | 1 (start); wait +0x4c (grp2) & ~mask(+0x3c): bit7 done -> 0; bits1-2/8 error -> +0x20 |= 8 (clear FIFO), -1; ack +0x4c |= 0x180
+          [callers: usb_bot_rx_cbw, usb_bulk_in_irq, usb_bot_data_in, usb_bot_data_out]
+
+func_073  0x5458  int usb_bot_rx_cbw()
+          usb_fifo_dma(0xF07D414C, 31, out); signature "USBC" (0x43425355): CSW tag/residue from CBW, status 0, scsi_dispatch() and return its state; else 1
+          [callers: usb_bulk_out_irq]
+
+func_074  0x54bc  usb_bot_arm()
+          [leaf, jump table on g_bot_state 1..6] re-arm bulk FIFO interrupt masks (+0x38 bits 4,5,16) for the next phase; state 6 -> usb_bot_halt
+          [callers: usb_bulk_out_irq, usb_bulk_in_irq, usb_clear_feature]
+
+func_075  0x558c  usb_bulk_out_irq()
+          g_bot_state 1: usb_bot_rx_cbw() (0x1f bytes in FIFO) -> new state, else +0x84 |= 0x800 (stall OUT); 3: usb_bot_data_out(); then usb_bot_arm
+          [callers: usb_poll]
+
+func_076  0x55f0  usb_bulk_in_irq()
+          g_bot_state 2: data-in; 4: send CSW (13 B from 0xF07D413C) -> state 1, g_usb_state 1 -> 2 (download complete, leaves usb_boot); usb_bot_arm
+          [callers: usb_poll]
+
+func_077  0x565c  usb_bot_reset()
+          g_bot_state = 1; CSW signature "USBS"; +0x38 bulk masks; scsi_clear_sense()
+          [callers: usb_class_request, usb_setup_irq]
+
+func_078  0x56b4  u16 cdb_sum(u32 w0, u32 w1, u32 w2, u32 w3)
+          sum of the 8 halfwords + 0x1c (same rule as UART); 0 = good
+          [callers: nvt_vendor_cdb]
+
+func_079  0x56e8  int nvt_vendor_cdb(const u8 *cbw)
+          CB[0] in 0xC0/0xE0/0xF0 (& 0xdf == 0xc0, or 0xf0) else -1; CB[1]: 0x81 IS_NVT -> 4-byte reply 0x70210000 (constant, unlike UART), bad sum -> CSW status 1; 0x01 OPEN_DEVICE: timer_stop, g_usb_opened = 1; 0x82 WAIT_DONE: g_usb_state = 1; 0x03 ADDR_WRITE (opened): *addr = val, dsb; 0x83 ADDR_READ (opened): 8-byte reply addr, *addr; 0x02 WRLOADER (opened): OUT phase of CBW length to addr, g_usb_dl_addr = addr
+          [callers: scsi_dispatch]
+
+func_080  0x5964  usb_dev_hw_init()
+          +0 |= bit4 (SFRST) and wait clear; grp2 status +0x4c |= 7; +0x3c = 0x600, +0x38 = ~0; +8 |= 1; +0 |= 0x24 (CHIP_EN|GLINT_EN); +0x14 &= ~1
+          [callers: usb_init]
+
+func_081  0x59dc  usb_init()
+          g_usb_regs (0xF07D416C) = 0xFF600100; zero ep0 ctx fields; usb_dev_hw_init; ctx+0x30 = 1
+          [callers: usb_boot]
+
+func_082  0x5a34  usb_cfg_eps_hs()
+          after SET_CONFIGURATION, if not yet configured: EP map +0xa0/+0xa1, FIFO map +0xa8/+0xa9, FIFO cfg +0xac..+0xaf (bulk, 512 B, double buffer), IN EP1 maxpkt +0x60 = 0x200, OUT EP2 maxpkt +0x84 = 0x200
+          [callers: usb_set_configuration]
+
+func_083  0x5ac0  usb_cfg_eps_fs()
+          same with 64-byte max packet
+          [callers: usb_set_configuration]
+
+func_084  0x5b58  usb_ep0_status()
+          ctx+0x2c = 0; +0x20 |= 1 (CX done)
+          [callers: usb_poll]
+
+func_085  0x5b8c  int usb_ep0_dma(void *buf, u32 len, int in)
+          as usb_fifo_dma but target CX FIFO (+0xc0 = 0x10000)
+          [callers: usb_ep0_tx_next, usb_get_status, usb_get_configuration, usb_get_interface, usb_class_request]
+
+func_086  0x5c1c  usb_ep0_tx_next()
+          send next chunk of the pending control-IN data (ctx+0x10 len, +0x14 ptr); done -> ctx+0xc = 1, +0x2c = 0
+          [callers: usb_get_descriptor, usb_ep0_in_irq]
+
+func_087  0x5c74  usb_reset_toggles()
+          pulse bit12 (reset toggle) of IN EP 1..8 (+0x60..) and OUT EP 1..8 (+0x80..)
+          [callers: usb_set_configuration, usb_set_interface]
+
+func_088  0x5cd8  int usb_get_status()
+          recipient device: bit1 = DEV_CTRL bit0 (remote wakeup); interface: 0; endpoint: bit0 = stall bit11 of the EP register found via the EP/FIFO maps (+0xa0/+0xac); 2-byte reply via usb_ep0_dma
+          [callers: usb_std_request]
+
+func_089  0x5dd0  int usb_clear_feature()
+          ENDPOINT_HALT: reset toggle, clear stall (bits 12, 11), usb_bot_arm; DEVICE_REMOTE_WAKEUP: +0 &= ~1
+          [callers: usb_std_request]
+
+func_090  0x5eb8  int usb_set_feature()
+          ENDPOINT_HALT: set stall bit11; REMOTE_WAKEUP: +0 |= 1
+          [callers: usb_std_request]
+
+func_091  0x5f84  int usb_set_address()
+          wValue <= 0xff -> +4 = address
+          [callers: usb_std_request]
+
+func_092  0x5fc0  int usb_get_descriptor()
+          by wValue type (first table when ctx+0x28 high-speed == 0, second when 1): 1 device 0x79dc/0x7a3c (identical), 2 config 0x79bc (64 B bulk) / 0x7a1c (512 B), 3 string by wValue low byte 0x00 langid 0x798c, 0x10 0x796c, 0x20 0x795c, 0x30 0x7940, 0x40 0x791c, 0x50 0x78f0, 0x60 0x78d8, 6 qualifier 0x79b0/0x7a10, 7 other-speed 0x7990/0x79f0; length clipped to wLength, copied to 0xF0800420, usb_ep0_tx_next
+          [callers: usb_std_request]
+
+func_093  0x61b0  int usb_get_configuration()
+          1-byte reply from ctx+0x18
+          [callers: usb_std_request]
+
+func_094  0x61dc  int usb_set_configuration()
+          wValue 0: +4 &= ~0x80 (unconfigured); 1: usb_cfg_eps_hs/fs (ctx+0x28), +0x10 = 0x44c (HS) / 0x2710 (FS), +4 |= 0x80, usb_reset_toggles
+          [callers: usb_std_request]
+
+func_095  0x627c  int usb_get_interface()
+          configured (+4 bit7) and wIndex <= 1: 1-byte reply ctx+0x20
+          [callers: usb_std_request]
+
+func_096  0x62e0  int usb_set_interface()
+          configured, wIndex 0, wValue 0 only; usb_reset_toggles
+          [callers: usb_std_request]
+
+func_097  0x634c  usb_ep0_in_irq()
+          pending control-IN -> usb_ep0_tx_next, else +0x20 |= 4 (stall)
+          [callers: usb_poll]
+
+func_098  0x638c  usb_ep0_out_irq()
+          +0x20 |= 4 (stall: no control-OUT data supported)
+          [callers: usb_poll]
+
+func_099  0x63b0  usb_bot_halt()
+          +0x14 |= 1
+          [callers: usb_bot_arm]
+
+func_100  0x63d4  int usb_std_request()
+          bRequest 0 get_status, 1 clear_feature, 3 set_feature, 5 set_address, 6 get_descriptor, 8 get_configuration, 9 set_configuration, 10 get_interface, 11 set_interface (6..11 refused once ctx+0x24 set); 2/4/7 -> -1
+          [callers: usb_setup_irq]
+
+func_101  0x64c0  int usb_class_request()
+          0xFE GET_MAX_LUN -> 1 byte 0; 0xFF BOT reset -> usb_bot_reset
+          [callers: usb_setup_irq]
+
+func_102  0x6524  usb_setup_irq()
+          first SETUP: ctx+0x28 = +0 bit6 (HS), usb_bot_reset; read 8-byte setup from +0xd0 twice; type (bits 6:5) 0 std, 1 class, else stall; failure -> ctx+0xc = 2 (stall)
+          [callers: usb_poll]
+
+func_103  0x65b8  usb_poll()
+          group status +0x40 & ~+0x30: grp0 (+0x44 & ~+0x34): bit0 setup, bit1 EP0 IN, bit2 EP0 OUT, bit3 status done, bit4 stall, bit5 abort; then EP0 result ctx+0xc: 2 stall, 1 done (+0x20 bits 2/0). grp1 (+0x48 & ~+0x38): bits 4/5 bulk OUT FIFO -> usb_bulk_out_irq (+0xb8 = FIFO byte count), bit16 bulk IN -> usb_bulk_in_irq. grp2 (+0x4c): reset/suspend/resume W1C, reset clears ctx+8
+          [callers: usb_boot]
+
+func_104  0x674c  scsi_request_sense()
+          18-byte fixed-format sense from 0x7c20, key/ASC patched from g_sense; clear g_sense
+          [callers: scsi_dispatch]
+
+func_105  0x67c8  scsi_clear_sense()
+          g_sense_key = g_sense_asc = 0
+          [callers: scsi_clear_sense_wrap, scsi_dispatch]
+
+func_106  0x67e8  scsi_clear_sense_wrap()
+          calls scsi_clear_sense (separate symbol in the original)
+          [callers: usb_bot_reset]
+
+func_107  0x67f8  scsi_inquiry()
+          36 bytes from 0x7c34: removable, SCSI-2, "Novatek " "NTIVOT          " "1.11"
+          [callers: scsi_dispatch]
+
+func_108  0x6834  scsi_mode_sense6()
+          page 0 -> 12 bytes, 0x3f -> 8 bytes, from 0x7c58; other pages: sense 5/0x24, status 1
+          [callers: scsi_dispatch]
+
+func_109  0x68c4  scsi_invalid_opcode()
+          sense 5/0x20, CSW status 1
+          [callers: scsi_dispatch]
+
+func_110  0x68f4  scsi_no_medium()
+          CSW status 1, stall IN (+0x60) or OUT (+0x84) per CBW direction, sense 2/0x3a
+          [callers: usb_bot_data_in, usb_bot_data_out]
+
+func_111  0x6958  int usb_bot_data_in()
+          xfer type 7: usb_fifo_dma(0xF07D40A0, len, in); residue -= len; residue left: wait +0x20[9:8]==3 then stall IN; -> state 4
+          [callers: usb_bot_data_phase]
+
+func_112  0x69e8  int usb_bot_data_out()
+          type 3 (download): usb_fifo_dma(addr, len, out) into the loader address, residue -= len; type 7: data-in variant; errors stall OUT; -> state 4
+          [callers: usb_bulk_out_irq, usb_bulk_in_irq, usb_bot_data_phase]
+
+func_113  0x6ab0  int usb_bot_data_phase()
+          Thirteen-case BOT check (host vs device length/direction, CBW length at +8 and flags at +0xc): match -> usb_bot_data_in/out; mismatch -> stall + CSW status 2 (phase error); returns next g_bot_state
+          [callers: scsi_dispatch]
+
+func_114  0x6c14  int scsi_dispatch()
+          LUN != 0 -> sense 2/0x25; opcode 0x00 TEST_UNIT_READY -> no medium (2/0x3a); 0x03 REQUEST_SENSE; 0x12 INQUIRY; 0x1a MODE_SENSE6; 0x1e PREVENT_ALLOW -> clear sense; 0x25/0x28/0x2a/0x2f READ CAPACITY/READ10/WRITE10/VERIFY -> no medium; 0xC0-class -> nvt_vendor_cdb, < 0 -> scsi_invalid_opcode; then usb_bot_data_phase
+          [callers: usb_bot_rx_cbw]
+
+
+Exported decompressors (ROM services for the loader)
+----------------------------------------------------
+
+func_118  0x6f2c  u32 LZ_Uncompress(const u8 *in, u8 *out, u32 insize)
+          Novatek LZ77: in[0] = marker; literal bytes copied; marker + 0 = literal marker; marker + varint length (7-bit groups, MSB-first, bit7 = more) + varint offset = back-reference; returns bytes written (insize==0 returns 0). Exported at 0x7FD4
+          [callers: export 0x7FD4]
+
+func_120  0x7044  rc_normalize(rc_t *rc)
+          LZMA range coder: if in_ptr >= in_end debug_msg("die: truncated input"); range <<= 8; code = code<<8 | *in++
+          [callers: rc_bit, lzma_inflate]
+
+func_121  0x7094  int rc_bit(rc_t *rc, u16 *prob)
+          LZMA bit decode with 11-bit probabilities (kNumMoveBits 5)
+          [callers: lzma_inflate]
+
+func_124  0x716c  int lzma_inflate(const u8 *in, u32 in_size, u8 *out, u32 out_size, u16 *tmp, u32 tmp_size)
+          LZMA-alone decoder (13-byte header: props, dict, 64-bit size). UART1 SCR (0xF030001C) bit0: print the six arguments, bit1: print lc/pb/lp/dst_size/dst_size_high/dict_size (debug_msg_var). Errors: "wrn: too short lzma file" (in_size <= 15), "wrn: bad lzma header" (props >= 225), "die: tmp_size need: " (prob array (0x736 + 0x300<<(lc+lp))*2 > tmp_size), "wrn: too small output buffer", "wrn: failed"; return -1 on error, else bytes out. Exported at 0x7FD0
+          [callers: export 0x7FD0]
+
+
+Ethernet state machine (eth_boot, g_eth.state at 0xF07D4040, table 0x39a4)
+-------------------------------------------------------------------------
+
+  Received frames (one per RX descriptor, ring of 4 at 0xF07D0040):
+    state 2  'a' xid (+0x2e) == g_eth.xid: "Of", yiaddr/siaddr, "IP %08X
+             SRV %08X\r\n", options from +0x11a: option 1 -> "MSK %08X\r\n";
+             server MAC (+6) saved; (yiaddr ^ siaddr) & mask == 0 -> state 3;
+             'b' after every frame in this state
+    state 3  ignored
+    state 4  'c' xid match -> "Ak", state 5        (DHCPACK not parsed)
+    5..10    'C' (needs an IP); ARP 0x0806: 'D', request for our IP: 'a',
+             reply built in place, 'r', eth_xmit, 'p'; IPv4: src == server,
+             dst == ours, 't', UDP dport 2962, TFTP opcode 3 (DATA):
+             put_hex32(block), ACK to the server's source port, block <= 64:
+             data copied to 0xF07C0000 + (block-1)*512; data < 512 -> state 10
+  Timer-driven (jump table at 0x39a4, run when no frame is pending):
+    0 -> 1
+    1 "S1"  DHCPDISCOVER (templates 0x7a90 + 0x7abc), xid++, timer_start, -> 2
+    2       5 s without an offer: -> 1, retries++; retries >= (OTP[20:18]+1)*6
+            -> boot_fail(10) "K:"
+    3 "S2"  DHCPREQUEST (opt 53=3, 50 = yiaddr, 54 = siaddr) then 'a', -> 4
+    4       wait for the ACK (no timeout)
+    5 "S3"  ARP request for the server (template 0x7be8), -> 6
+    6       -> 7 (the ARP reply is not awaited)
+    7 "S4"  TFTP RRQ "loader.bin" "octet" from port 2962 to port 69
+            (templates 0x7a50 + 0x7a7c), 'a', -> 8
+    8, 9    wait for DATA (no timeout, no retransmit)
+    10 "Dn" leave the loop
+  Captured on hardware (NT9856x board, UART0): "NHE" reg0 old/new, reg5,
+  "s100F", "X", then "RI\r\n" per frame, "S1", "aOfIP .. SRV ..", "MSK ..",
+  "bS2", "cAkS3S4", "CD", "Ct00000001" ...  The 'a' that state 3 prints after
+  "S2" (0x3bfc) is not in that capture.
+
+Data (non-code) entries
+-----------------------
+
+data_00  0x0020  reset/exception vector targets, 7 words (0x54, 0x3c..0x50)
+data_01  0x01c0  boot_dispatch jump table, 16 words indexed by TOP+0[3:0]
+                 (see bootrom.txt)
+data_02  0x02e4  start.S literal pool (0x2e4..0x31c)
+data_03  0x09d0  flash_boot strap switch, 11 entries (0 'P', 2/6 'D', 3/0xA 'R',
+                 others boot_fail(6))
+data_04  0x1998  hdr_script_run opcode table, 11 entries (ops 0..10)
+data_05  0x39a4  eth_boot timer state table, 11 entries (states 0..10)
+data_06  0x54d4  usb_bot_arm table, 6 entries (g_bot_state 1..6)
+data_07  0x5fe4  usb_get_descriptor type table, 7 entries (types 1..7)
+data_08  0x63f0  usb_std_request table, 12 entries (bRequest 0..11)
+data_09  0x78d8  USB string "0123456789" (serial, 0x16 B)
+data_10  0x78f0  USB string "OTHER_S CONFIG STRING" (0x2c B)
+data_11  0x791c  USB string "INTERFACE STRING" (0x22 B)
+data_12  0x7940  USB string "CONFIG STRING" (0x1c B)
+data_13  0x795c  USB string "NTIVOT" (product, 0x0e B)
+data_14  0x796c  USB string "NovaTek    INC." (manufacturer, 0x20 B)
+data_15  0x798c  USB string 0: langid 0x0409
+data_16  0x7990  other-speed config (for FS: 512-byte bulk EPs), 0x20 B
+data_17  0x79b0  device qualifier, 0x0a B
+data_18  0x79bc  configuration (FS): 1 interface, class 08/06/50 (mass storage,
+                 SCSI, bulk-only), EP 0x81 bulk IN + 0x02 bulk OUT, 64 B
+data_19  0x79dc  device descriptor: USB 2.0, ep0 64, idVendor 0x1233,
+                 idProduct 0x5677, bcdDevice 0x0001, iManufacturer 0x10,
+                 iProduct 0x20, iSerial 0x60 (string indices are the ROM's
+                 own 0x10-step codes)
+data_20  0x79f0  other-speed config (for HS: 64-byte EPs)
+data_21  0x7a10  device qualifier (copy)
+data_22  0x7a1c  configuration (HS): as data_18 with 512-byte EPs
+data_23  0x7a3c  device descriptor (copy of data_19)
+data_24  0x7a50  TFTP frame template, 0x2a B: broadcast MAC, src
+                 00:55:7b:b5:7d:f7 (patched), IPv4 TTL 255 UDP, 0.0.0.0 ->
+                 255.255.255.255 (patched), sport 2962 (0x0b92) dport 69
+data_25  0x7a7c  TFTP RRQ payload: 00 01 "loader.bin" 00 "octet" 00 (0x13 B)
+data_26  0x7a90  DHCP frame template, 0x2a B: UDP 68 -> 67
+data_27  0x7abc  BOOTP payload, 0x12c B: op 1, htype 1, hlen 6, xid
+                 0x00003d1d (patched), chaddr 00:55:7b:b5:7d:f7 (patched),
+                 cookie 63 82 53 63, options 53=1 (DISCOVER), 50=0.0.0.0, end
+data_28  0x7be8  ARP request template, 0x2a B
+data_29  0x7c20  SCSI REQUEST SENSE reply template (0x70, add-len 10), 18 B
+data_30  0x7c34  SCSI INQUIRY reply, 36 B: 00 80 02 02 1f ..
+                 "Novatek NTIVOT          1.11"
+data_31  0x7c58  SCSI MODE SENSE(6) reply, 8/12 B
+data_32  0x7c60  lzma_inflate / debug strings: "die: truncated input", "E:",
+                 "wrn: too short lzma file", "in_ptr", "in_size", "out_ptr",
+                 "out_size", "p_tmp", "tmp_size", "wrn: bad lzma header",
+                 "lc\r\n", "pb\r\n", "lp\r\n", "dst_size\r\n",
+                 "dst_size_high\r\n", "dict_size\r\n", "die: tmp_size need: ",
+                 "wrn: too small output buffer:", "wrn: too small output
+                 buffer", "wrn: failed" (0x7c60..0x7d66)
+data_33  0x7fbc  ROM service table, called by the loader through pointers
+                 (bl_func.c ROM_LZMA_POSITION etc.):
+                   0x7FB8  0xffffffff     (vprintf slot on NA51103: empty here)
+                   0x7FBC  0x6d68  sha256(data, len, out)
+                   0x7FC0  0x6d20  put_hex32(v)
+                   0x7FC4  0x78d8  start of const data   (inferred: section
+                   0x7FC8  0x7a50  start of frame/string  bounds, not
+                   0x7FCC  0x7d68  end of const data       functions)
+                   0x7FD0  0x716c  lzma_inflate(in, in_size, out, out_size,
+                                   tmp, tmp_size)
+                   0x7FD4  0x6f2c  LZ_Uncompress(in, out, in_size)
+                   0x7FD8  0x700c  debug_msg(str)
+                   0x7FDC  0x7144  debug_msg_var(str, value)
+                   0x7FE0  0x7114  debug_msg_err(str, value)
+                   0x7FE4  0x6eb4  efuse_read(index)
+                   0x7FE8  0x16e8  memcpy32(dst, src, n)  (not used by the
+                                   known loaders)
+                   0x7FEC  0x6d20  Dec2HexStr = put_hex32 (prints, returns
+                                   nothing)
+                 matches qemu-bench nvt-bootrom.c for 0x7FD0..0x7FEC; the
+                 0x7FBC/0x7FC0 entries and the 0x7FC4..0x7FCC words are new
+data_34  0x7ff0  0xffffffff, "REAL" (0x7ff4), 0x00000000, 0x00000116
+                 (0x116: ROM version 1.16? inferred)
