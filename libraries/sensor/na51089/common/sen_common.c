@@ -141,6 +141,10 @@ void sen_common_load_cfg_preset_compatible(struct device_node *of_node, void *pa
 		DBG_ERR("cannot find %s \r\n", keystr);
 		return;
 	}
+	if (path >= CTL_SEN_ID_MAX) {
+		DBG_ERR("%s = %d out of range \r\n", keystr, path);
+		return;
+	}
 	#if (SEN_COMMON_SHOW_MSG == 1)
 	vk_printk("%s = %d \r\n", keystr, path);
 	#endif
@@ -239,6 +243,10 @@ void sen_common_load_cfg_direction_compatible(struct device_node *of_node, void 
 	sprintf((char *)keystr, "path");
 	if (of_property_read_u32(of_node, keystr, &path) != 0) {
 		DBG_ERR("cannot find %s \r\n", keystr);
+		return;
+	}
+	if (path >= CTL_SEN_ID_MAX) {
+		DBG_ERR("%s = %d out of range \r\n", keystr, path);
 		return;
 	}
 	#if (SEN_COMMON_SHOW_MSG == 1)
@@ -371,6 +379,10 @@ void sen_common_load_cfg_power_compatible(struct device_node *of_node, void *par
 		DBG_ERR("cannot find %s \r\n", keystr);
 		return;
 	}
+	if (path >= CTL_SEN_ID_MAX) {
+		DBG_ERR("%s = %d out of range \r\n", keystr, path);
+		return;
+	}
 	#if (SEN_COMMON_SHOW_MSG == 1)
 	vk_printk("%s = %d \r\n", keystr, path);
 	#endif
@@ -491,6 +503,10 @@ void sen_common_load_cfg_i2c_compatible(struct device_node *of_node, void *param
 	sprintf((char *)keystr, "path");
 	if (of_property_read_u32(of_node, keystr, &path) != 0) {
 		DBG_ERR("cannot find %s \r\n", keystr);
+		return;
+	}
+	if (path >= CTL_SEN_ID_MAX) {
+		DBG_ERR("%s = %d out of range \r\n", keystr, path);
 		return;
 	}
 	#if (SEN_COMMON_SHOW_MSG == 1)

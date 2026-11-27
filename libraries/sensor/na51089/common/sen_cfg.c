@@ -133,10 +133,11 @@ static char *sen_cfg_find_key_string(const char *key_name, CFG_FILE_FMT *cfile, 
 		}
 
 		// key_name matched, looking for the equal sign '=' after key_name
-		if ((s2 = strchr((char *)(s1+key_len), CHAR_EQUAL)) != NULL) {
-			for (++s2; IS_SPACE(*s2); ++s2) {
-				;  // skip space charactors next to '='
-			}
+		if ((s2 = strchr((char *)(s1+key_len), CHAR_EQUAL)) == NULL) {
+			return (char *)NULL;  // "key" without '=': treat as not found
+		}
+		for (++s2; IS_SPACE(*s2); ++s2) {
+			;  // skip space charactors next to '='
 		}
 
 		return s2;  // return the value string
@@ -262,11 +263,21 @@ INT32 sen_cfg_get_field_str(char *section, const INT8 *key_name, INT8 *buf, INT3
 		return -1;  // key_name not found
 	}
 
+	if (buf_size <= 0) {
+		return -1;
+	}
+
+	// keep one byte for the terminating NUL
 	cp_size = strnlen(key_str, LINE_LEN);
-	if (cp_size > buf_size) {
-		cp_size = buf_size;
+	if (cp_size > buf_size - 1) {
+		cp_size = buf_size - 1;
 	}
 	memcpy(buf_ptr, key_str, cp_size);
+
+	if (cp_size == 0) {  // "key =": empty value
+		buf_ptr[0] = CHAR_NULL;
+		return 0;
+	}
 
 	// check if the last character is '\\'
 	lastc = buf_ptr[cp_size-1];
@@ -292,9 +303,13 @@ INT32 sen_cfg_get_field_str(char *section, const INT8 *key_name, INT8 *buf, INT3
 			break;
 		}
 
+		// keep one byte for the terminating NUL
 		cp_size = strnlen(line, LINE_LEN);
-		if (cp_size > buf_size) {
-			cp_size = buf_size;
+		if (cp_size > buf_size - 1) {
+			cp_size = buf_size - 1;
+		}
+		if (cp_size <= 0) {
+			break;  // empty continuation line, or buffer full
 		}
 		memcpy(buf_ptr, line, cp_size);
 

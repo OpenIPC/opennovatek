@@ -1,5 +1,5 @@
 &sen_cfg {
-	sen_imx307 {
+	sen_imx307_slave {
 		MAP {
 			path_1 = <1>;                        /* Path 1 Enable */
 			path_2 = <1>;                        /* Path 2 Disable */

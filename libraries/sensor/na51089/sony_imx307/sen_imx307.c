@@ -1774,12 +1774,12 @@ static void sen_ext_get_probe_sen_imx307(CTL_SEN_ID id, CTL_SENDRV_GET_PROBE_SEN
 	rt |= sen_read_reg_imx307(id, &cmd);
 	read_data = cmd.data[0];
 
-	if ((read_data & 0x06) == SENSOR_ID) {
+	if (rt != E_OK) {
+		data->probe_rst = rt;  // read failed: read_data is not the sensor's
+	} else if ((read_data & 0x06) == SENSOR_ID) {
 		data->probe_rst = 0;
-	} else if ((read_data & 0x06) != SENSOR_ID) {
+	} else {
 		data->probe_rst = -1;
-	} else if ( rt != E_OK) {
-		data->probe_rst = rt;
 	}
 }
 

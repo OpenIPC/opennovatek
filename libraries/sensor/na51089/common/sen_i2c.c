@@ -503,10 +503,12 @@ static struct i2c_board_info sen_i2c_device[CTL_SEN_ID_MAX] = {
 static ER sen_i2c_init_driver(UINT32 id, SEN_I2C *sen_i2c)
 {
 	ER ret = E_OK;
+	struct i2c_client *client;
 
 	// add i2c_device to i2c bus
 	sen_i2c_device[id].addr = sen_i2c->addr;
-	if (i2c_new_device(i2c_get_adapter(sen_i2c->id), &sen_i2c_device[id]) == NULL) {
+	client = i2c_new_device(i2c_get_adapter(sen_i2c->id), &sen_i2c_device[id]);
+	if (client == NULL) {
 		DBG_ERR(" i2c_new_device fail. \r\n");
 		return E_SYS;
 	}
@@ -514,6 +516,17 @@ static ER sen_i2c_init_driver(UINT32 id, SEN_I2C *sen_i2c)
 	// bind i2c client driver to i2c bus
 	if ((ret = i2c_add_driver(&sen_i2c_driver[id])) != 0) {
 		DBG_ERR(" i2c_add_driver fail. \r\n");
+		i2c_unregister_device(client);
+		return ret;
+	}
+
+	// i2c_add_driver() binds synchronously; a failed probe (or none at all)
+	// leaves sen_i2c_info[id] NULL, which every later call would dereference
+	if (sen_i2c_info[id] == NULL) {
+		DBG_ERR(" i2c probe fail. \r\n");
+		i2c_del_driver(&sen_i2c_driver[id]);
+		i2c_unregister_device(client);
+		return E_SYS;
 	}
 
 	return ret;
@@ -521,12 +534,19 @@ static ER sen_i2c_init_driver(UINT32 id, SEN_I2C *sen_i2c)
 
 static void sen_i2c_remove_driver(UINT32 id)
 {
-	i2c_unregister_device(sen_i2c_info[id]->iic_client);
+	if (sen_i2c_info[id] != NULL) {
+		i2c_unregister_device(sen_i2c_info[id]->iic_client);
+	}
 	i2c_del_driver(&sen_i2c_driver[id]);
 }
 
 static INT32 sen_i2c_transfer(UINT32 id, struct i2c_msg *msgs, INT32 num)
 {
+	if (unlikely(sen_i2c_info[id] == NULL)) {
+		DBG_ERR(" sen_i2c_info[%d] is NULL. \r\n", id);
+		return -1;
+	}
+
 	if (unlikely(sen_i2c_info[id]->iic_adapter == NULL)) {
 		DBG_ERR(" sensen_i2c_info->ii2c_adapter fail. \r\n");
 		return -1;
