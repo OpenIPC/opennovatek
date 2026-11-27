@@ -53,8 +53,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned, so that this repo's CI changes only when this repo does.
+          # kernel_sha: openipc/linux novatek-nt9856x; firmware_sha:
+          # openipc/firmware, the source of kernel_config.
           - chiparch: na51089
-            kernel_branch: novatek-nt9856x
+            kernel_sha: e75a4165c34b24c4191fe285fe922a756f8fa01d
+            firmware_sha: 11d097ca473e2975f5b326cf7eda163d96d19ce2
             kernel_config: br-ext-chip-novatek/board/nt9856x/nt98566.generic.config
     steps:
       - uses: actions/checkout@v4
@@ -67,11 +71,13 @@ jobs:
 
       - name: Fetch and configure the kernel
         run: |
-          git clone --depth 1 -b ${{ matrix.kernel_branch }} \
-              https://github.com/openipc/linux ../linux
+          git init -q ../linux
+          git -C ../linux fetch -q --depth 1 https://github.com/openipc/linux ${{ matrix.kernel_sha }}
+          git -C ../linux checkout -q FETCH_HEAD
           curl -fsSL -o ../linux/.config \
-              https://raw.githubusercontent.com/openipc/firmware/master/${{ matrix.kernel_config }}
+              https://raw.githubusercontent.com/openipc/firmware/${{ matrix.firmware_sha }}/${{ matrix.kernel_config }}
           cd ../linux
+          echo "kernel $(git rev-parse HEAD), config from firmware ${{ matrix.firmware_sha }}"
           # The signed-regdb keyring pulls in extract-cert, which does not
           # build against current OpenSSL; sensors do not need either.
           ./scripts/config --disable CFG80211 --disable SYSTEM_TRUSTED_KEYRING

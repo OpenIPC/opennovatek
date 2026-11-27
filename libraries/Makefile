@@ -35,6 +35,13 @@ all:
 	fi
 
 clean:
-	@for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean; done
+	@failed=""; \
+	for dir in $(SUBDIRS); do \
+		$(MAKE) -C $$dir clean || failed="$$failed $$dir"; \
+	done; \
+	if [ -n "$$failed" ]; then \
+		echo "Clean failed for:$$failed" >&2; \
+		exit 1; \
+	fi
 
 .PHONY: all clean
