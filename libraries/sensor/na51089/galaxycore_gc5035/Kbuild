@@ -1,0 +1,2 @@
+SEN := gc5035
+include $(src)/../common/sensor.kbuild

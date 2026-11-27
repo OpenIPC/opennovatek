@@ -1,0 +1,2 @@
+SEN := ov2736ir
+include $(src)/../common/sensor.kbuild

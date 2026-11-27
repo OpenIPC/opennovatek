@@ -1,0 +1,2 @@
+SEN := gc4663
+include $(src)/../common/sensor.kbuild

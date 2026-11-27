@@ -1,0 +1,2 @@
+SEN := ov2715
+include $(src)/../common/sensor.kbuild

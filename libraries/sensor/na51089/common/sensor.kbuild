@@ -1,0 +1,21 @@
+# Kbuild fragment shared by every na51089 sensor driver.
+#
+# Each sensor directory has a two-line Kbuild that sets SEN (the model, as in
+# sen_$(SEN).c) and includes this file. The result is nvt_sen_$(SEN).ko, the
+# vendor's module name, so it drops into an existing HDAL rootfs unchanged:
+# the driver registers itself with ctl_sen as "nvt_sen_$(SEN)" either way.
+#
+# The vendor SDK symlinked sen_cfg.c and sen_common.c into every sensor
+# directory; here they stay in common/ and are compiled into each module by
+# the pattern rule below (sen_common.c pulls in sen_i2c.c by #include).
+
+NA51089_INC := $(src)/../../../../kernel/include/na51089
+
+ccflags-y += -D__LINUX -DDEBUG -Wno-date-time
+ccflags-y += -I$(NA51089_INC) -I$(src)/../common
+
+obj-m := nvt_sen_$(SEN).o
+nvt_sen_$(SEN)-objs := sen_cfg.o sen_common.o sen_$(SEN).o
+
+$(obj)/sen_cfg.o $(obj)/sen_common.o: $(obj)/%.o: $(src)/../common/%.c FORCE
+	$(call if_changed_rule,cc_o_c)

@@ -1,0 +1,2 @@
+SEN := sc2239
+include $(src)/../common/sensor.kbuild

@@ -1,0 +1,2 @@
+SEN := s5k231y
+include $(src)/../common/sensor.kbuild

@@ -3,3 +3,11 @@ bootrom/*/bootrom.bin
 bootrom/*/disasm.txt
 *.o
 *.elf
+# Out-of-tree kernel module build products
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers

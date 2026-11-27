@@ -1,0 +1,2 @@
+SEN := sc200ai
+include $(src)/../common/sensor.kbuild
