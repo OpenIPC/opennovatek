@@ -18,7 +18,7 @@ device tree or from a `.cfg` file passed as `sen_cfg_path=`.
     common/sensor.kbuild    the Kbuild every sensor directory includes
     common/sensor.mk        the out-of-tree make driver
     <vendor>_<model>/
-        sen_<model>.c       the driver, unchanged from the SDK
+        sen_<model>.c       the driver, as the SDK ships it (see Changes)
         Kbuild, Makefile    two lines and one line
         configs/            the SDK's EVB wiring presets for this sensor:
                             sen_<model>[_565|_56x].cfg and the matching
@@ -52,10 +52,12 @@ On a current host, 4.19's own build needs two nudges: `HOSTCFLAGS=-fcommon`
 (`extract-cert` does not link against OpenSSL 3+). The CI job in
 `.github/workflows/build.yml` does exactly this.
 
-The imported tree builds warning-free with the SDK's GCC 8.4 (uClibc) and
-with GCC 13, and with the SDK's GCC 8.4 against the SDK kernel every module's
-`.text` and its undefined-symbol list are identical to what the SDK's own
-Makefiles produce.
+The tree builds warning-free with the SDK's GCC 8.4 (uClibc) and with
+GCC 13. As imported (commit a6c28df, before the fixes listed under Changes),
+built with Buildroot GCC 8.4 against the OpenIPC kernel and config,
+`sc401ai`, `sc500ai`, `sc501ai` and `imx415` have `.text`, `.rodata` and
+`.data` byte for byte identical to the vendor modules OpenIPC firmware
+shipped; only `.modinfo` (`depends=`) and the compiler banner differ.
 
 The modules resolve `ctl_sen_*`, `isp_builtin_*` and `kdrv_builtin_*` at
 load time from the vendor kflow/kdrv modules, which stay binary.
@@ -94,6 +96,7 @@ load time from the vendor kflow/kdrv modules, which stay binary.
 | `smart_sc4238` | `nvt_sen_sc4238.ko` | 1.43.000 |
 | `smart_sc450ai` | `nvt_sen_sc450ai.ko` | 1.46.000 |
 | `smart_sc500ai` | `nvt_sen_sc500ai.ko` | 1.44.000 |
+| `smart_sc501ai` | `nvt_sen_sc501ai.ko` | 1.44.000 |
 | `smart_sc8238` | `nvt_sen_sc8238.ko` | 1.44.000 |
 | `soi_f35` | `nvt_sen_f35.ko` | 1.44.000 |
 | `soi_f37` | `nvt_sen_f37.ko` | 1.44.000 |
@@ -114,8 +117,31 @@ Not imported: `sen_off` (an empty placeholder module), and the SDK's
 `imx291`, `imx290_fpga` and `os02k10d` configs, which have no driver in
 this SDK.
 
-## Notes
+## SC501AI
 
-- **SmartSens SC501AI** runs on `smart_sc500ai`: select sensor mode 2
-  (2880x1620) explicitly, at 25 fps; `HD_VIDEOCAP_SEN_MODE_AUTO` does not
-  pick a working mode for it.
+Novatek has no separate SC501AI driver: the `nvt_sen_sc501ai.ko` OpenIPC
+firmware shipped is `sen_sc500ai.c` with the name changed, and
+`smart_sc501ai/Kbuild` generates its source the same way. Tested on an
+NT98566 + SC501AI camera: in place of the vendor module it loads, streams
+2880x1620 and leaves the same kernel log. With bare HDAL (no majestic),
+select sensor mode 2 explicitly at 25 fps; `HD_VIDEOCAP_SEN_MODE_AUTO` does
+not pick a working mode.
+
+## Changes against the SDK
+
+Fixes made after import, from review (commit a6c28df is the SDK verbatim):
+
+- `common/sen_cfg.c`: a key without `=` returned an uninitialised pointer;
+  an empty value read one byte before the buffer; a value that filled the
+  buffer had its terminator written one byte past it (continuation lines
+  too).
+- `common/sen_common.c`: the device-tree `path` indexed
+  `CTL_SEN_ID_MAX`-sized arrays unchecked.
+- `common/sen_i2c.c`: a failed I2C probe left `sen_i2c_info[id]` NULL while
+  init reported success, so close and every transfer dereferenced NULL; the
+  new client leaked when `i2c_add_driver` failed.
+- `sony_imx290`, `sony_imx307`, `sony_imx307_slave`: the sensor-ID probe
+  compared the ID before checking the I2C read, so IMX290 (ID 0) took a
+  failed read for a match.
+- `sony_imx307_slave/configs/*.dtsi`: the node was named `sen_imx307`, but
+  the driver looks for `sen_imx307_slave`.

@@ -1,0 +1,20 @@
+# SmartSens SC501AI.
+#
+# Novatek never shipped a separate sen_sc501ai.c: the nvt_sen_sc501ai.ko that
+# OpenIPC firmware carried is sen_sc500ai.c with every "sc500ai"/"SC500AI"
+# renamed. Built that way from the same source with the same toolchain
+# (Buildroot GCC 8.4) and kernel config, its .text, .rodata and .data match
+# the vendor module byte for byte. So this directory generates its source
+# from ../smart_sc500ai instead of carrying a second copy.
+
+SEN := sc501ai
+include $(src)/../common/sensor.kbuild
+
+quiet_cmd_sc501ai = GEN     $@
+      cmd_sc501ai = sed 's/sc500ai/sc501ai/g; s/SC500AI/SC501AI/g' $< > $@
+
+$(obj)/sen_sc501ai.c: $(src)/../smart_sc500ai/sen_sc500ai.c FORCE
+	$(call if_changed,sc501ai)
+
+targets += sen_sc501ai.c
+clean-files := sen_sc501ai.c
