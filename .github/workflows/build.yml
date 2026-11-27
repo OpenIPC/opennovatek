@@ -43,3 +43,50 @@ jobs:
 
       - name: Scripts parse
         run: for s in bootrom/scripts/*.sh; do sh -n "$s"; done
+
+  # Every libraries/sensor/na51089 driver must build against the kernel
+  # OpenIPC ships for NT9856x, configured the way OpenIPC firmware does it.
+  sensors:
+    name: sensors ${{ matrix.chiparch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chiparch: na51089
+            kernel_branch: novatek-nt9856x
+            kernel_config: br-ext-chip-novatek/board/nt9856x/nt98566.generic.config
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              gcc-arm-linux-gnueabihf bc bison flex libssl-dev
+
+      - name: Fetch and configure the kernel
+        run: |
+          git clone --depth 1 -b ${{ matrix.kernel_branch }} \
+              https://github.com/openipc/linux ../linux
+          curl -fsSL -o ../linux/.config \
+              https://raw.githubusercontent.com/openipc/firmware/master/${{ matrix.kernel_config }}
+          cd ../linux
+          # The signed-regdb keyring pulls in extract-cert, which does not
+          # build against current OpenSSL; sensors do not need either.
+          ./scripts/config --disable CFG80211 --disable SYSTEM_TRUSTED_KEYRING
+          # -fcommon: 4.19's dtc predates GCC 10's -fno-common default.
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- HOSTCFLAGS=-fcommon olddefconfig
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- HOSTCFLAGS=-fcommon -j$(nproc) modules_prepare
+
+      - name: Build libraries/
+        run: |
+          make -C libraries CHIPARCH=${{ matrix.chiparch }} \
+              KERNELDIR=$PWD/../linux CROSS_COMPILE=arm-linux-gnueabihf-
+
+      - name: One module per sensor directory
+        run: |
+          want=$(ls -d libraries/sensor/${{ matrix.chiparch }}/*/Kbuild | wc -l)
+          got=$(find libraries/sensor/${{ matrix.chiparch }} -name 'nvt_sen_*.ko' | wc -l)
+          echo "built $got of $want"
+          test "$got" -eq "$want"

@@ -1,0 +1,2 @@
+SEN := jinglin_ti_module
+include $(src)/../common/sensor.kbuild

@@ -1,0 +1,2 @@
+SEN := os04c10
+include $(src)/../common/sensor.kbuild

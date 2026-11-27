@@ -1,0 +1,2 @@
+SEN := imx230
+include $(src)/../common/sensor.kbuild

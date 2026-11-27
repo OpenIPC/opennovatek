@@ -1,0 +1,2 @@
+SEN := imx307_slave
+include $(src)/../common/sensor.kbuild

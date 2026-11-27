@@ -1,0 +1,2 @@
+SEN := sc3335
+include $(src)/../common/sensor.kbuild

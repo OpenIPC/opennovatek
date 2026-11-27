@@ -1,0 +1,2 @@
+SEN := os08a10
+include $(src)/../common/sensor.kbuild

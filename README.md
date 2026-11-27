@@ -3,7 +3,15 @@
 Open, auditable sources for Novatek IP-camera SoCs, in the spirit of
 [OpenIPC/openhisilicon](https://github.com/OpenIPC/openhisilicon).
 
-So far this holds one thing: `bootrom/`, a clean-room reconstruction of the
+Layout follows openhisilicon:
+
+- `libraries/sensor/<chiparch>/<vendor>_<model>/`: image-sensor drivers built
+  from vendor SDK source. For NA51089 these are kernel modules
+  (`nvt_sen_*.ko`); see [libraries/sensor/na51089](libraries/sensor/na51089/README.md).
+- `kernel/include/<chiparch>/`: the vendor SDK headers those drivers need.
+- `bootrom/`: described below.
+
+`bootrom/` is a clean-room reconstruction of the
 on-chip mask ROM of NA51089 (NT98560, NT98561, NT98562, NT98566) as
 reviewable C and ARM assembly. The vendor ROM image itself is never committed:
 each contributor dumps it from their own camera, and `MANIFEST` pins the

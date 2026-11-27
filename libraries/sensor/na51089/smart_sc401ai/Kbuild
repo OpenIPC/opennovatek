@@ -1,0 +1,2 @@
+SEN := sc401ai
+include $(src)/../common/sensor.kbuild

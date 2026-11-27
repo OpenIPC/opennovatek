@@ -1,0 +1,2 @@
+SEN := f35
+include $(src)/../common/sensor.kbuild
