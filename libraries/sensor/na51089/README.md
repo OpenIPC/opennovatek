@@ -3,7 +3,8 @@
 Image-sensor drivers for Novatek NA51089 (NT98560, NT98561, NT98562,
 NT98566), imported from the vendor Linux SDK
 `na51089_linux_sdk_uclibc_v1.01.002` (`code/hdal/ext_devices/sensor`)
-and built here outside it.
+and built here outside it, plus an open-source SC430AI driver that is not
+from the SDK (see [SC430AI](#sc430ai)).
 
 Unlike HiSilicon's userspace `libsns_*.so`, a Novatek sensor driver is a
 kernel module. It registers itself with the HDAL capture framework
@@ -94,6 +95,7 @@ load time from the vendor kflow/kdrv modules, which stay binary.
 | `smart_sc401ai` | `nvt_sen_sc401ai.ko` | 1.46.000 |
 | `smart_sc4210` | `nvt_sen_sc4210.ko` | 1.45.000 |
 | `smart_sc4238` | `nvt_sen_sc4238.ko` | 1.43.000 |
+| `smart_sc430ai` | `nvt_sen_sc430ai.ko` | not from the SDK |
 | `smart_sc450ai` | `nvt_sen_sc450ai.ko` | 1.46.000 |
 | `smart_sc500ai` | `nvt_sen_sc500ai.ko` | 1.44.000 |
 | `smart_sc501ai` | `nvt_sen_sc501ai.ko` | 1.44.000 |
@@ -126,6 +128,36 @@ NT98566 + SC501AI camera: in place of the vendor module it loads, streams
 2880x1620 and leaves the same kernel log. With bare HDAL (no majestic),
 select sensor mode 2 explicitly at 25 fps; `HD_VIDEOCAP_SEN_MODE_AUTO` does
 not pick a working mode.
+
+## SC430AI
+
+The SDK has no SC430AI driver. `smart_sc430ai` is a clean-room GPL-2.0
+driver by Vladimir Bely, from OpenIPC/firmware#2977, tested there on a Dahua
+DH-IPC-HFW2449SP-S-IL (NT98566 + SC430AI): 2688x1520 at 30 and 60 fps
+linear, mirror and flip. Its third mode, 2-frame stagger HDR, is untested.
+
+It is self-contained: its own I2C access and `.cfg` parser instead of
+`common/`, so no device-tree wiring, and its Kbuild does not include
+`sensor.kbuild`. It is built against the SDK's HDAL headers like the rest.
+
+Changes since that PR (commit b1ba5dc is the PR verbatim):
+
+- The hand-written copies of the HDAL structs and ids are replaced by the
+  SDK types. The generated code is unchanged except that the HDR mode now
+  reports `CTL_SEN_MODE_STAGGER_HDR` (5); it reported 2, which is
+  `CTL_SEN_MODE_BUILTIN_HDR`.
+- The ISP's preset (`USER_DEFINE1`, an `ISP_SENSOR_PRESET_CTRL`) was read as
+  the cfg preset, so a mode change after it started from a bogus exposure
+  and gain. Presets now follow the SDK drivers.
+- The MCLK callback got the sensor id instead of the configured clock;
+  `GET_FPS` swapped its two fields.
+- Mode selection checks frame count, lanes, pixel depth and mode type
+  against each mode and fails a request no mode meets; a 2-frame request
+  at 60 fps got the linear 60 fps mode.
+- A `sen_cfg_path` that cannot be read fails the load instead of falling
+  back to the built-in wiring. A mode change stops at the first failed
+  write rather than going on to stream on. Frame rates below what the
+  frame-length register reaches report the rate it gives.
 
 ## Changes against the SDK
 
