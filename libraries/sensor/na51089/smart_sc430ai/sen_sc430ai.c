@@ -31,11 +31,10 @@
 
 #define SEN_MAX_MODE		3
 
+/* The cfg file's [PRESET]: exposure and gain until the ISP sends its own. */
 struct sen_preset_cfg {
 	u32 expt_time;
 	u32 gain_ratio;
-	u32 frame_rate;
-	u32 pad[2];
 };
 
 struct sen_power_cfg {
@@ -179,6 +178,7 @@ struct sc430ai_state {
 	u32 compensation_gain[2];
 	ISP_SENSOR_CTRL ctrl;
 	struct sen_preset_cfg preset;
+	ISP_SENSOR_PRESET_CTRL preset_ctrl;
 	struct sen_power_cfg power;
 	struct sen_i2c_cfg i2c;
 };
@@ -463,8 +463,8 @@ static void sc430ai_pwr_ctrl(CTL_SEN_ID id, CTL_SEN_PWR_CTRL_FLAG flag, CTL_SEN_
 				gpiod_set_raw_value(gd, 1);
 			}
 		}
-		if (clk_cb)
-			clk_cb(id, TRUE);
+		if (clk_cb && p->mclk != CTL_SEN_IGNORE)
+			clk_cb(p->mclk, TRUE);
 		if (p->rst_pin != CTL_SEN_IGNORE) {
 			msleep(p->stable_time);
 			gd = gpio_to_desc(p->rst_pin);
@@ -482,8 +482,8 @@ static void sc430ai_pwr_ctrl(CTL_SEN_ID id, CTL_SEN_PWR_CTRL_FLAG flag, CTL_SEN_
 			if (gd)
 				gpiod_set_raw_value(gd, 0);
 		}
-		if (clk_cb)
-			clk_cb(id, FALSE);
+		if (clk_cb && p->mclk != CTL_SEN_IGNORE)
+			clk_cb(p->mclk, FALSE);
 		if (p->pwdn_pin != CTL_SEN_IGNORE) {
 			gd = gpio_to_desc(p->pwdn_pin);
 			if (gd)
@@ -496,6 +496,7 @@ static ER sc430ai_open(CTL_SEN_ID id)
 {
 	if (id >= CTL_SEN_ID_MAX)
 		return -EINVAL;
+	g_sen[id].preset_ctrl.mode = ISP_SENSOR_PRESET_DEFAULT;
 	if (g_sen[id].adap)
 		return 0;
 	g_sen[id].adap = i2c_get_adapter(g_sen[id].i2c.id);
@@ -561,6 +562,39 @@ static ER sc430ai_chg_fps(CTL_SEN_ID id, UINT32 fps)
 	return ret;
 }
 
+/*
+ * Exposure and gain to start a mode with, as the SDK drivers choose them:
+ * the cfg preset on the first mode change after open (the short frame of
+ * HDR at 1/8 of it), what was last set on later ones, or what the ISP asked
+ * for through CTL_SENDRV_CFGID_USER_DEFINE1.
+ */
+static void sc430ai_get_preset(CTL_SEN_ID id, ISP_SENSOR_CTRL *ctrl)
+{
+	const ISP_SENSOR_PRESET_CTRL *pc = &g_sen[id].preset_ctrl;
+
+	memset(ctrl, 0, sizeof(*ctrl));
+	switch (pc->mode) {
+	case ISP_SENSOR_PRESET_CHGMODE:
+		*ctrl = g_sen[id].ctrl;
+		break;
+	case ISP_SENSOR_PRESET_AE:
+		ctrl->exp_time[0] = pc->exp_time[0];
+		ctrl->exp_time[1] = pc->exp_time[1];
+		ctrl->gain_ratio[0] = pc->gain_ratio[0];
+		ctrl->gain_ratio[1] = pc->gain_ratio[1];
+		break;
+	case ISP_SENSOR_PRESET_DEFAULT:
+	default:
+		ctrl->exp_time[0] = g_sen[id].preset.expt_time;
+		ctrl->gain_ratio[0] = g_sen[id].preset.gain_ratio;
+		if (mode_basic_param[g_sen[id].cur_mode].frame_num == 2) {
+			ctrl->exp_time[1] = g_sen[id].preset.expt_time >> 3;
+			ctrl->gain_ratio[1] = g_sen[id].preset.gain_ratio;
+		}
+		break;
+	}
+}
+
 static ER sc430ai_chg_mode(CTL_SEN_ID id, CTL_SENDRV_CHGMODE_OBJ obj)
 {
 	const struct sc430ai_reg *tbl;
@@ -594,11 +628,7 @@ static ER sc430ai_chg_mode(CTL_SEN_ID id, CTL_SENDRV_CHGMODE_OBJ obj)
 		} else if (tbl[i].addr == SEN_CMD_SETVD) {
 			ret |= sc430ai_chg_fps(id, g_sen[id].chg_fps);
 		} else if (tbl[i].addr == SEN_CMD_PRESET) {
-			memset(&ctrl, 0, sizeof(ctrl));
-			ctrl.exp_time[0] = g_sen[id].preset.expt_time;
-			ctrl.exp_time[1] = g_sen[id].preset.expt_time;
-			ctrl.gain_ratio[0] = g_sen[id].preset.gain_ratio;
-			ctrl.gain_ratio[1] = g_sen[id].preset.gain_ratio;
+			sc430ai_get_preset(id, &ctrl);
 			ret |= sc430ai_set_expt(id, &ctrl);
 			ret |= sc430ai_set_gain(id, &ctrl);
 		} else if (tbl[i].addr == SEN_CMD_DIRECTION) {
@@ -607,6 +637,9 @@ static ER sc430ai_chg_mode(CTL_SEN_ID id, CTL_SENDRV_CHGMODE_OBJ obj)
 			ret |= sc430ai_i2c_write(id, (u16)tbl[i].addr, tbl[i].val);
 		}
 	}
+
+	/* A later mode change keeps the exposure AE has reached by then. */
+	g_sen[id].preset_ctrl.mode = ISP_SENSOR_PRESET_CHGMODE;
 
 	return ret;
 }
@@ -624,8 +657,7 @@ static ER sc430ai_set_info(CTL_SEN_ID id, CTL_SENDRV_CFGID cfg_id, void *data)
 	case CTL_SENDRV_CFGID_FLIP_TYPE:
 		return sc430ai_set_flip(id, *(CTL_SEN_FLIP *)data);
 	case CTL_SENDRV_CFGID_USER_DEFINE1:
-		/* TODO: this is ISP_SENSOR_PRESET_CTRL, not our preset */
-		memcpy(&g_sen[id].preset, data, sizeof(g_sen[id].preset));
+		memcpy(&g_sen[id].preset_ctrl, data, sizeof(g_sen[id].preset_ctrl));
 		return 0;
 	default:
 		return E_NOSPT;
@@ -677,8 +709,8 @@ static ER sc430ai_get_info(CTL_SEN_ID id, CTL_SENDRV_CFGID cfg_id, void *data)
 	case CTL_SENDRV_CFGID_GET_FPS: {
 		CTL_SENDRV_GET_FPS_PARAM *out = data;
 
-		out->chg_fps = g_sen[id].cur_fps;
-		out->cur_fps = g_sen[id].chg_fps;
+		out->chg_fps = g_sen[id].chg_fps;
+		out->cur_fps = g_sen[id].cur_fps;
 		return 0;
 	}
 	case CTL_SENDRV_CFGID_GET_SPEED: {
@@ -857,7 +889,6 @@ static int __init sc430ai_init(void)
 		g_sen[i].compensation_gain[1] = 100;
 		g_sen[i].preset.expt_time = 10000;
 		g_sen[i].preset.gain_ratio = 1000;
-		g_sen[i].preset.frame_rate = 3000;
 		g_sen[i].power.mclk = CTL_SEN_CLK_SEL_SIEMCLK;
 		g_sen[i].power.pwdn_pin = CTL_SEN_IGNORE;
 		g_sen[i].power.rst_pin = 0x41; /* S_GPIO_1 */
