@@ -7,6 +7,10 @@
  *   0: 2688x1520 @ 30fps, 10-bit linear
  *   1: 2688x1520 @ 60fps, 10-bit linear
  *   2: 2688x1520 @ 30fps, 10-bit 2-frame Stagger HDR
+ *
+ * Unlike the SDK drivers in this tree, this one is self-contained: it has its
+ * own I2C access and cfg parser instead of ../common. The HDAL interface
+ * types come from the SDK headers (kflow_videocapture/ctl_sen.h, isp_api.h).
  */
 
 #include <linux/module.h>
@@ -18,124 +22,14 @@
 #include <linux/string.h>
 #include <linux/gpio/consumer.h>
 
+#include "kwrap/error_no.h"
+#include "kwrap/type.h"
+#include "kflow_videocapture/ctl_sen.h"
+#include "isp_api.h"
+
 #include "sc430ai_regs.h"
 
-#define SEN_MAX_ID		8
 #define SEN_MAX_MODE		3
-#define SEN_IF_TYPE_MIPI	2
-#define SEN_DATA_FMT_RGB	0
-#define SEN_CMDIF_TYPE_I2C	3
-#define SEN_MODE_LINEAR		1
-#define SEN_MODE_STAGGER_HDR	2
-#define SEN_STPIX_R		0
-#define SEN_PROPERTY_ALL	0x7 /* MIRROR | FLIP | CHGFPS */
-
-#define SEN_E_NOSPT		(-17)
-
-/* CTL_SEN_CFGID_* (2022 HDAL ABI) */
-#define CFGID_SET_EXPT		0x00000001U
-#define CFGID_SET_GAIN		0x00000002U
-#define CFGID_GET_EXPT		0x01000001U
-#define CFGID_GET_GAIN		0x01000002U
-#define CFGID_GET_ATTR_BASIC	0x01000003U
-#define CFGID_GET_ATTR_SIGNAL	0x01000004U
-#define CFGID_GET_ATTR_CMDIF	0x01000005U
-#define CFGID_GET_ATTR_IF	0x01000006U
-#define CFGID_GET_FPS		0x01000008U
-#define CFGID_GET_MODE_SPEED	0x01000009U
-#define CFGID_GET_MODESEL	0x0100000aU
-#define CFGID_GET_MODE_BASIC	0x0100000bU
-#define CFGID_GET_MODE_MIPI	0x0100000dU
-#define CFGID_GET_MIN_EXPT	0x01000018U
-#define CFGID_FLIP_TYPE		0x02000001U
-#define CFGID_USER_DEFINE1	0x03000001U
-#define CFGID_USER_DEFINE2	0x03000002U
-
-struct ctl_sen_cmd {
-	u32 addr;
-	u32 data_len;
-	u32 data[2];
-};
-
-struct ctl_sen_chgmode_obj {
-	u32 mode;
-	u32 frame_rate;
-};
-
-struct ctl_sen_drv_tab {
-	int (*open)(u32 id);
-	int (*close)(u32 id);
-	int (*sleep)(u32 id);
-	int (*wakeup)(u32 id);
-	int (*write_reg)(u32 id, struct ctl_sen_cmd *cmd);
-	int (*read_reg)(u32 id, struct ctl_sen_cmd *cmd);
-	int (*chg_mode)(u32 id, struct ctl_sen_chgmode_obj obj);
-	int (*chg_fps)(u32 id, u32 fps);
-	int (*set_cfg)(u32 id, u32 cfg_id, void *data);
-	int (*get_cfg)(u32 id, u32 cfg_id, void *data);
-};
-
-typedef void (*ctl_sen_clk_cb)(u32 id, bool en);
-
-struct ctl_sen_reg_sendrv {
-	void (*pwr_ctrl)(u32 id, u32 flag, ctl_sen_clk_cb clk_cb);
-	int (*det_plug_in)(u32 id);
-	struct ctl_sen_drv_tab *drv_tab;
-};
-
-/* 2022 HDAL ABI: 0x94 (148) bytes */
-struct ctl_sen_mode_basic_param {
-	u32 mode;
-	u32 if_type;
-	u32 data_fmt;
-	u32 mode_type;
-	u32 dft_fps;
-	u32 frame_num;
-	u32 stpix;
-	u32 pixel_depth;
-	u32 fmt;
-	u32 valid_w;
-	u32 valid_h;
-	u32 act_rect[4][4]; /* {x, y, w, h} x 4 */
-	u32 crp_w;
-	u32 crp_h;
-	u32 hd_sync;
-	u32 hd_period;
-	u32 vd_sync;
-	u32 vd_period;
-	u32 ratio_h_v;
-	u32 gain_min;
-	u32 gain_max;
-	u32 gain_prec;
-};
-
-struct ctl_sen_basic_param {
-	char name[32];
-	u32 vendor;
-	u32 max_sen_mode;
-	u32 property;
-	u32 sync_timing;
-};
-
-struct ctl_sen_speed_param {
-	u32 mode;
-	u32 mclksrc;
-	u32 mclk;
-	u32 pclk;
-	u32 data_rate;
-};
-
-struct ctl_sen_mipi_param {
-	u32 mode;
-	u32 clk_lane;
-	u32 data_lane;
-	u32 pad[12];
-};
-
-struct isp_sensor_ctrl {
-	u32 exp_time[2];
-	u32 gain_ratio[2];
-};
 
 struct sen_preset_cfg {
 	u32 expt_time;
@@ -157,9 +51,6 @@ struct sen_i2c_cfg {
 	u32 addr;
 };
 
-extern int ctl_sen_reg_sendrv(char *name, struct ctl_sen_reg_sendrv *reg);
-extern int ctl_sen_unreg_sendrv(char *name);
-
 static char *sen_cfg_path = "null";
 module_param(sen_cfg_path, charp, 0644);
 MODULE_PARM_DESC(sen_cfg_path, "Path of cfg file");
@@ -168,104 +59,115 @@ static int sen_debug_level;
 module_param(sen_debug_level, int, 0644);
 MODULE_PARM_DESC(sen_debug_level, "Debug message level");
 
-static const struct ctl_sen_basic_param basic_param = {
+static const CTL_SENDRV_GET_ATTR_BASIC_PARAM basic_param = {
 	.name = "sen_sc430ai",
-	.vendor = 4,
-	.max_sen_mode = SEN_MAX_MODE,
-	.property = SEN_PROPERTY_ALL,
+	.vendor = CTL_SEN_VENDOR_OTHERS,
+	.max_senmode = SEN_MAX_MODE,
+	.property = CTL_SEN_SUPPORT_PROPERTY_MIRROR | CTL_SEN_SUPPORT_PROPERTY_FLIP |
+		    CTL_SEN_SUPPORT_PROPERTY_CHGFPS,
 	.sync_timing = 0,
 };
 
-static const struct ctl_sen_mode_basic_param mode_basic_param[SEN_MAX_MODE] = {
+static const CTL_SENDRV_GET_ATTR_SIGNAL_PARAM signal_param = {
+	.type = CTL_SEN_SIGNAL_MASTER,
+	.info = { CTL_SEN_ACTIVE_HIGH, CTL_SEN_ACTIVE_HIGH, CTL_SEN_PHASE_RISING,
+		  CTL_SEN_PHASE_RISING, CTL_SEN_PHASE_RISING },
+};
+
+static const CTL_SENDRV_GET_MODE_BASIC_PARAM mode_basic_param[SEN_MAX_MODE] = {
 	{
-		.mode = 0,
-		.if_type = SEN_IF_TYPE_MIPI,
-		.data_fmt = SEN_DATA_FMT_RGB,
-		.mode_type = SEN_MODE_LINEAR,
+		.mode = CTL_SEN_MODE_1,
+		.if_type = CTL_SEN_IF_TYPE_MIPI,
+		.data_fmt = CTL_SEN_DATA_FMT_RGB,
+		.mode_type = CTL_SEN_MODE_LINEAR,
 		.dft_fps = 3000,
 		.frame_num = 1,
-		.stpix = SEN_STPIX_R,
-		.pixel_depth = 10,
-		.fmt = 0,
-		.valid_w = 2688,
-		.valid_h = 1522,
-		.act_rect = { { 0, 2, 2688, 1520 } },
-		.crp_w = 2688,
-		.crp_h = 1520,
-		.hd_sync = 0,
-		.hd_period = 1600,
-		.vd_sync = 0,
-		.vd_period = 1650,
-		.ratio_h_v = 0x00100009,
-		.gain_min = 1000,
-		.gain_max = 301178,
-		.gain_prec = 100,
+		.stpix = CTL_SEN_STPIX_R,
+		.pixel_depth = CTL_SEN_PIXDEPTH_10BIT,
+		.fmt = CTL_SEN_FMT_POGRESSIVE,
+		.valid_size = { 2688, 1522 },
+		.act_size = { { 0, 2, 2688, 1520 } },
+		.crp_size = { 2688, 1520 },
+		.signal_info = { 0, 1600, 0, 1650 },
+		.ratio_h_v = CTL_SEN_RATIO(16, 9),
+		.gain = { 1000, 301178 },
+		.bining_ratio = 100,
 	},
 	{
-		.mode = 1,
-		.if_type = SEN_IF_TYPE_MIPI,
-		.data_fmt = SEN_DATA_FMT_RGB,
-		.mode_type = SEN_MODE_LINEAR,
+		.mode = CTL_SEN_MODE_2,
+		.if_type = CTL_SEN_IF_TYPE_MIPI,
+		.data_fmt = CTL_SEN_DATA_FMT_RGB,
+		.mode_type = CTL_SEN_MODE_LINEAR,
 		.dft_fps = 6000,
 		.frame_num = 1,
-		.stpix = SEN_STPIX_R,
-		.pixel_depth = 10,
-		.fmt = 0,
-		.valid_w = 2688,
-		.valid_h = 1522,
-		.act_rect = { { 0, 2, 2688, 1520 } },
-		.crp_w = 2688,
-		.crp_h = 1520,
-		.hd_sync = 0,
-		.hd_period = 1600,
-		.vd_sync = 0,
-		.vd_period = 1650,
-		.ratio_h_v = 0x00100009,
-		.gain_min = 1000,
-		.gain_max = 301178,
-		.gain_prec = 100,
+		.stpix = CTL_SEN_STPIX_R,
+		.pixel_depth = CTL_SEN_PIXDEPTH_10BIT,
+		.fmt = CTL_SEN_FMT_POGRESSIVE,
+		.valid_size = { 2688, 1522 },
+		.act_size = { { 0, 2, 2688, 1520 } },
+		.crp_size = { 2688, 1520 },
+		.signal_info = { 0, 1600, 0, 1650 },
+		.ratio_h_v = CTL_SEN_RATIO(16, 9),
+		.gain = { 1000, 301178 },
+		.bining_ratio = 100,
 	},
 	{
-		.mode = 2,
-		.if_type = SEN_IF_TYPE_MIPI,
-		.data_fmt = SEN_DATA_FMT_RGB,
-		.mode_type = SEN_MODE_STAGGER_HDR,
+		.mode = CTL_SEN_MODE_3,
+		.if_type = CTL_SEN_IF_TYPE_MIPI,
+		.data_fmt = CTL_SEN_DATA_FMT_RGB,
+		.mode_type = CTL_SEN_MODE_STAGGER_HDR,
 		.dft_fps = 3000,
 		.frame_num = 2,
-		.stpix = SEN_STPIX_R,
-		.pixel_depth = 10,
-		.fmt = 0,
-		.valid_w = 2688,
-		.valid_h = 1522,
-		.act_rect = { { 0, 2, 2688, 1520 }, { 0, 2, 2688, 1520 } },
-		.crp_w = 2688,
-		.crp_h = 1520,
-		.hd_sync = 0,
-		.hd_period = 1600,
-		.vd_sync = 0,
-		.vd_period = 3300,
-		.ratio_h_v = 0x00100009,
-		.gain_min = 1000,
-		.gain_max = 301178,
-		.gain_prec = 100,
+		.stpix = CTL_SEN_STPIX_R,
+		.pixel_depth = CTL_SEN_PIXDEPTH_10BIT,
+		.fmt = CTL_SEN_FMT_POGRESSIVE,
+		.valid_size = { 2688, 1522 },
+		.act_size = { { 0, 2, 2688, 1520 }, { 0, 2, 2688, 1520 } },
+		.crp_size = { 2688, 1520 },
+		.signal_info = { 0, 1600, 0, 3300 },
+		.ratio_h_v = CTL_SEN_RATIO(16, 9),
+		.gain = { 1000, 301178 },
+		.bining_ratio = 100,
 	},
 };
 
-static const struct ctl_sen_speed_param speed_param[SEN_MAX_MODE] = {
-	{ .mode = 0, .mclksrc = 0, .mclk = 27000000, .pclk = 158400000, .data_rate = 79200000 },
-	{ .mode = 1, .mclksrc = 0, .mclk = 27000000, .pclk = 316800000, .data_rate = 158400000 },
-	{ .mode = 2, .mclksrc = 0, .mclk = 27000000, .pclk = 316800000, .data_rate = 158400000 },
+static const CTL_SENDRV_GET_SPEED_PARAM speed_param[SEN_MAX_MODE] = {
+	{ CTL_SEN_MODE_1, CTL_SEN_SIEMCLK_SRC_DFT, 27000000, 158400000, 79200000 },
+	{ CTL_SEN_MODE_2, CTL_SEN_SIEMCLK_SRC_DFT, 27000000, 316800000, 158400000 },
+	{ CTL_SEN_MODE_3, CTL_SEN_SIEMCLK_SRC_DFT, 27000000, 316800000, 158400000 },
 };
 
-static const struct ctl_sen_mipi_param mipi_param[SEN_MAX_MODE] = {
-	{ .mode = 0, .clk_lane = 1, .data_lane = 4 },
-	{ .mode = 1, .clk_lane = 1, .data_lane = 4 },
-	{ .mode = 2, .clk_lane = 1, .data_lane = 4, .pad = { [7] = 1, [11] = 3 } },
+static const CTL_SENDRV_GET_MODE_MIPI_PARAM mipi_param[SEN_MAX_MODE] = {
+	{
+		.mode = CTL_SEN_MODE_1,
+		.clk_lane = CTL_SEN_CLKLANE_1,
+		.data_lane = CTL_SEN_DATALANE_4,
+		.sel_bit_ofs = SEN_BIT_OFS_NONE,
+	},
+	{
+		.mode = CTL_SEN_MODE_2,
+		.clk_lane = CTL_SEN_CLKLANE_1,
+		.data_lane = CTL_SEN_DATALANE_4,
+		.sel_bit_ofs = SEN_BIT_OFS_NONE,
+	},
+	{
+		.mode = CTL_SEN_MODE_3,
+		.clk_lane = CTL_SEN_CLKLANE_1,
+		.data_lane = CTL_SEN_DATALANE_4,
+		.sel_frm_id = { 1, 0, 0, 0 },
+		.sel_bit_ofs = SEN_BIT_OFS_0 | SEN_BIT_OFS_1,
+	},
 };
 
-static const u32 i2c_table_default[16] = {
-	0, 0x60, 1, 0xff, 2, 0xff, 3, 0xff,
-	4, 0xff, 5, 0xff, 0, 0, 0, 0,
+static const CTL_SENDRV_I2C i2c_table_default = {
+	.w_addr_info = {
+		{ CTL_SEN_I2C_W_ADDR_DFT,     0x60 },
+		{ CTL_SEN_I2C_W_ADDR_OPTION1, 0xff },
+		{ CTL_SEN_I2C_W_ADDR_OPTION2, 0xff },
+		{ CTL_SEN_I2C_W_ADDR_OPTION3, 0xff },
+		{ CTL_SEN_I2C_W_ADDR_OPTION4, 0xff },
+		{ CTL_SEN_I2C_W_ADDR_OPTION5, 0xff },
+	},
 };
 
 struct sc430ai_state {
@@ -275,13 +177,13 @@ struct sc430ai_state {
 	u32 chg_fps;
 	u32 direction;
 	u32 compensation_gain[2];
-	struct isp_sensor_ctrl ctrl;
+	ISP_SENSOR_CTRL ctrl;
 	struct sen_preset_cfg preset;
 	struct sen_power_cfg power;
 	struct sen_i2c_cfg i2c;
 };
 
-static struct sc430ai_state g_sen[SEN_MAX_ID];
+static struct sc430ai_state g_sen[CTL_SEN_ID_MAX];
 
 static int sc430ai_i2c_write(u32 id, u16 reg, u8 val)
 {
@@ -317,7 +219,11 @@ static int sc430ai_i2c_read(u32 id, u16 reg, u8 *val)
 	return (ret == 2) ? 0 : (ret < 0 ? ret : -EIO);
 }
 
-/* Half-line period in 0.1 us units (SC430AI exposure registers use half-lines, 2*VTS/frame). */
+/*
+ * Time per exposure step in 0.1 us. The SC430AI exposure registers count
+ * half-lines (2 * VTS per frame), and hd_period / pclk is a half-line here:
+ * 1600 / 158.4 MHz = 10.1 us, and 3300 half-lines of it make 33.3 ms.
+ */
 static u32 sc430ai_calc_rowtime_10x(u32 id, u32 mode)
 {
 	u32 pclk_100k;
@@ -327,14 +233,14 @@ static u32 sc430ai_calc_rowtime_10x(u32 id, u32 mode)
 	pclk_100k = speed_param[mode].pclk / 100000U;
 	if (!pclk_100k)
 		return 1;
-	return (100U * mode_basic_param[mode].hd_period) / pclk_100k;
+	return (100U * mode_basic_param[mode].signal_info.hd_period) / pclk_100k;
 }
 
 static u32 sc430ai_calc_vd(u32 id, u32 fps)
 {
 	u32 mode = g_sen[id].cur_mode;
 	u32 dft_fps = mode_basic_param[mode].dft_fps;
-	u32 dft_vd = mode_basic_param[mode].vd_period;
+	u32 dft_vd = mode_basic_param[mode].signal_info.vd_period;
 	u32 vd;
 
 	if (!fps || fps > dft_fps)
@@ -356,15 +262,15 @@ static int sc430ai_set_flip(u32 id, u32 dir)
 	ret = sc430ai_i2c_read(id, 0x3221, &val);
 	if (ret)
 		return ret;
-	if (dir & 1)
+	if (dir & CTL_SEN_FLIP_H)
 		val |= 0x06;
 	else
 		val &= ~0x06;
-	if (dir & 2)
+	if (dir & CTL_SEN_FLIP_V)
 		val |= 0x60;
 	else
 		val &= ~0x60;
-	g_sen[id].direction = dir & 3;
+	g_sen[id].direction = dir & CTL_SEN_FLIP_H_V;
 	return sc430ai_i2c_write(id, 0x3221, val);
 }
 
@@ -378,10 +284,10 @@ static u32 sc430ai_align_hdr_line(u32 line)
 	return line;
 }
 
-static int sc430ai_set_expt(u32 id, const struct isp_sensor_ctrl *ctrl)
+static int sc430ai_set_expt(u32 id, const ISP_SENSOR_CTRL *ctrl)
 {
 	u32 mode = g_sen[id].cur_mode;
-	const struct ctl_sen_mode_basic_param *mb = &mode_basic_param[mode];
+	const CTL_SENDRV_GET_MODE_BASIC_PARAM *mb = &mode_basic_param[mode];
 	u32 rowtime = sc430ai_calc_rowtime_10x(id, mode);
 	u32 line[2] = { 0, 0 }, req_line[2] = { 0, 0 };
 	u32 total_lines, fps, vd, max_long;
@@ -393,7 +299,7 @@ static int sc430ai_set_expt(u32 id, const struct isp_sensor_ctrl *ctrl)
 
 	for (i = 0; i < n && i < 2; i++) {
 		line[i] = (ctrl->exp_time[i] * 10U) / rowtime;
-		if (mb->mode_type == SEN_MODE_LINEAR) {
+		if (mb->mode_type == CTL_SEN_MODE_LINEAR) {
 			if (line[i] < 3)
 				line[i] = 3;
 		} else {
@@ -403,10 +309,10 @@ static int sc430ai_set_expt(u32 id, const struct isp_sensor_ctrl *ctrl)
 		req_line[i] = line[i];
 	}
 
-	if (mb->mode_type == SEN_MODE_STAGGER_HDR && line[1] > 0x180)
+	if (mb->mode_type == CTL_SEN_MODE_STAGGER_HDR && line[1] > 0x180)
 		line[1] = 0x180;
 
-	total_lines = (mb->mode_type == SEN_MODE_STAGGER_HDR) ?
+	total_lines = (mb->mode_type == CTL_SEN_MODE_STAGGER_HDR) ?
 		      (line[0] + line[1]) : line[0];
 	fps = (total_lines * rowtime) / 10U;
 	fps = fps ? (100000000U / fps) : mb->dft_fps;
@@ -414,9 +320,9 @@ static int sc430ai_set_expt(u32 id, const struct isp_sensor_ctrl *ctrl)
 		fps = g_sen[id].chg_fps;
 	if (!fps)
 		fps = mb->dft_fps;
-	vd = (mb->dft_fps * mb->vd_period) / fps;
-	if (vd < mb->vd_period)
-		vd = mb->vd_period;
+	vd = (mb->dft_fps * mb->signal_info.vd_period) / fps;
+	if (vd < mb->signal_info.vd_period)
+		vd = mb->signal_info.vd_period;
 	if (vd > 0x7fff)
 		vd = 0x7fff;
 	g_sen[id].cur_fps = fps;
@@ -424,7 +330,7 @@ static int sc430ai_set_expt(u32 id, const struct isp_sensor_ctrl *ctrl)
 	ret = sc430ai_i2c_write(id, 0x320e, (vd >> 8) & 0x7f);
 	ret |= sc430ai_i2c_write(id, 0x320f, vd & 0xff);
 
-	if (mb->mode_type == SEN_MODE_LINEAR) {
+	if (mb->mode_type == CTL_SEN_MODE_LINEAR) {
 		max_long = (vd - 5) * 2;
 		if (line[0] > 0xffff)
 			line[0] = 0xffff;
@@ -513,10 +419,10 @@ static void sc430ai_calc_gain(u32 gain, u32 comp, u32 min_g, u32 max_g,
 	*dgain_fine = (u8)fine;
 }
 
-static int sc430ai_set_gain(u32 id, const struct isp_sensor_ctrl *ctrl)
+static int sc430ai_set_gain(u32 id, const ISP_SENSOR_CTRL *ctrl)
 {
 	u32 mode = g_sen[id].cur_mode;
-	const struct ctl_sen_mode_basic_param *mb = &mode_basic_param[mode];
+	const CTL_SENDRV_GET_MODE_BASIC_PARAM *mb = &mode_basic_param[mode];
 	u8 ag[2] = { 0, 0 }, dc[2] = { 0, 0 }, df[2] = { 0x80, 0x80 };
 	u32 i, n = mb->frame_num ? mb->frame_num : 1;
 	int ret;
@@ -526,12 +432,12 @@ static int sc430ai_set_gain(u32 id, const struct isp_sensor_ctrl *ctrl)
 
 	for (i = 0; i < n && i < 2; i++)
 		sc430ai_calc_gain(ctrl->gain_ratio[i], g_sen[id].compensation_gain[i],
-				  mb->gain_min, mb->gain_max, &ag[i], &dc[i], &df[i]);
+				  mb->gain.min, mb->gain.max, &ag[i], &dc[i], &df[i]);
 
 	ret = sc430ai_i2c_write(id, 0x3e09, ag[0]);
 	ret |= sc430ai_i2c_write(id, 0x3e06, dc[0]);
 	ret |= sc430ai_i2c_write(id, 0x3e07, df[0]);
-	if (mb->mode_type == SEN_MODE_STAGGER_HDR) {
+	if (mb->mode_type == CTL_SEN_MODE_STAGGER_HDR) {
 		ret |= sc430ai_i2c_write(id, 0x3e13, ag[1]);
 		ret |= sc430ai_i2c_write(id, 0x3e10, dc[1]);
 		ret |= sc430ai_i2c_write(id, 0x3e11, df[1]);
@@ -539,17 +445,17 @@ static int sc430ai_set_gain(u32 id, const struct isp_sensor_ctrl *ctrl)
 	return ret;
 }
 
-static void sc430ai_pwr_ctrl(u32 id, u32 flag, ctl_sen_clk_cb clk_cb)
+static void sc430ai_pwr_ctrl(CTL_SEN_ID id, CTL_SEN_PWR_CTRL_FLAG flag, CTL_SEN_CLK_CB clk_cb)
 {
 	struct sen_power_cfg *p;
 	struct gpio_desc *gd;
 
-	if (id >= SEN_MAX_ID)
+	if (id >= CTL_SEN_ID_MAX)
 		return;
 	p = &g_sen[id].power;
 
-	if (flag == 0) { /* TURN_ON */
-		if (p->pwdn_pin != 0xffffffffU) {
+	if (flag == CTL_SEN_PWR_CTRL_TURN_ON) {
+		if (p->pwdn_pin != CTL_SEN_IGNORE) {
 			gd = gpio_to_desc(p->pwdn_pin);
 			if (gd) {
 				gpiod_direction_output_raw(gd, 0);
@@ -558,8 +464,8 @@ static void sc430ai_pwr_ctrl(u32 id, u32 flag, ctl_sen_clk_cb clk_cb)
 			}
 		}
 		if (clk_cb)
-			clk_cb(id, true);
-		if (p->rst_pin != 0xffffffffU) {
+			clk_cb(id, TRUE);
+		if (p->rst_pin != CTL_SEN_IGNORE) {
 			msleep(p->stable_time);
 			gd = gpio_to_desc(p->rst_pin);
 			if (gd) {
@@ -570,15 +476,15 @@ static void sc430ai_pwr_ctrl(u32 id, u32 flag, ctl_sen_clk_cb clk_cb)
 				msleep(p->stable_time);
 			}
 		}
-	} else { /* TURN_OFF */
-		if (p->rst_pin != 0xffffffffU) {
+	} else {
+		if (p->rst_pin != CTL_SEN_IGNORE) {
 			gd = gpio_to_desc(p->rst_pin);
 			if (gd)
 				gpiod_set_raw_value(gd, 0);
 		}
 		if (clk_cb)
-			clk_cb(id, false);
-		if (p->pwdn_pin != 0xffffffffU) {
+			clk_cb(id, FALSE);
+		if (p->pwdn_pin != CTL_SEN_IGNORE) {
 			gd = gpio_to_desc(p->pwdn_pin);
 			if (gd)
 				gpiod_set_raw_value(gd, 0);
@@ -586,9 +492,9 @@ static void sc430ai_pwr_ctrl(u32 id, u32 flag, ctl_sen_clk_cb clk_cb)
 	}
 }
 
-static int sc430ai_open(u32 id)
+static ER sc430ai_open(CTL_SEN_ID id)
 {
-	if (id >= SEN_MAX_ID)
+	if (id >= CTL_SEN_ID_MAX)
 		return -EINVAL;
 	if (g_sen[id].adap)
 		return 0;
@@ -600,9 +506,9 @@ static int sc430ai_open(u32 id)
 	return 0;
 }
 
-static int sc430ai_close(u32 id)
+static ER sc430ai_close(CTL_SEN_ID id)
 {
-	if (id >= SEN_MAX_ID)
+	if (id >= CTL_SEN_ID_MAX)
 		return -EINVAL;
 	if (g_sen[id].adap) {
 		i2c_put_adapter(g_sen[id].adap);
@@ -611,29 +517,29 @@ static int sc430ai_close(u32 id)
 	return 0;
 }
 
-static int sc430ai_sleep(u32 id)
+static ER sc430ai_sleep(CTL_SEN_ID id)
 {
 	return 0;
 }
 
-static int sc430ai_wakeup(u32 id)
+static ER sc430ai_wakeup(CTL_SEN_ID id)
 {
 	return 0;
 }
 
-static int sc430ai_write_reg(u32 id, struct ctl_sen_cmd *cmd)
+static ER sc430ai_write_reg(CTL_SEN_ID id, CTL_SEN_CMD *cmd)
 {
-	if (id >= SEN_MAX_ID || !cmd)
+	if (id >= CTL_SEN_ID_MAX || !cmd)
 		return -EINVAL;
 	return sc430ai_i2c_write(id, (u16)cmd->addr, (u8)cmd->data[0]);
 }
 
-static int sc430ai_read_reg(u32 id, struct ctl_sen_cmd *cmd)
+static ER sc430ai_read_reg(CTL_SEN_ID id, CTL_SEN_CMD *cmd)
 {
 	u8 val = 0;
 	int ret;
 
-	if (id >= SEN_MAX_ID || !cmd)
+	if (id >= CTL_SEN_ID_MAX || !cmd)
 		return -EINVAL;
 	ret = sc430ai_i2c_read(id, (u16)cmd->addr, &val);
 	if (!ret)
@@ -641,12 +547,12 @@ static int sc430ai_read_reg(u32 id, struct ctl_sen_cmd *cmd)
 	return ret;
 }
 
-static int sc430ai_chg_fps(u32 id, u32 fps)
+static ER sc430ai_chg_fps(CTL_SEN_ID id, UINT32 fps)
 {
 	u32 vd;
 	int ret;
 
-	if (id >= SEN_MAX_ID)
+	if (id >= CTL_SEN_ID_MAX)
 		return -EINVAL;
 	g_sen[id].chg_fps = fps;
 	vd = sc430ai_calc_vd(id, fps);
@@ -655,26 +561,26 @@ static int sc430ai_chg_fps(u32 id, u32 fps)
 	return ret;
 }
 
-static int sc430ai_chg_mode(u32 id, struct ctl_sen_chgmode_obj obj)
+static ER sc430ai_chg_mode(CTL_SEN_ID id, CTL_SENDRV_CHGMODE_OBJ obj)
 {
 	const struct sc430ai_reg *tbl;
 	size_t i, n;
-	struct isp_sensor_ctrl ctrl;
+	ISP_SENSOR_CTRL ctrl;
 	int ret = 0;
 
-	if (id >= SEN_MAX_ID)
+	if (id >= CTL_SEN_ID_MAX)
 		return -EINVAL;
 	if (obj.mode >= SEN_MAX_MODE)
-		obj.mode = 0;
+		obj.mode = CTL_SEN_MODE_1;
 
 	g_sen[id].cur_mode = obj.mode;
 	g_sen[id].chg_fps = obj.frame_rate ? obj.frame_rate : mode_basic_param[obj.mode].dft_fps;
 	g_sen[id].cur_fps = g_sen[id].chg_fps;
 
-	if (obj.mode == 1) {
+	if (obj.mode == CTL_SEN_MODE_2) {
 		tbl = sc430ai_mode_2;
 		n = ARRAY_SIZE(sc430ai_mode_2);
-	} else if (obj.mode == 2) {
+	} else if (obj.mode == CTL_SEN_MODE_3) {
 		tbl = sc430ai_mode_3;
 		n = ARRAY_SIZE(sc430ai_mode_3);
 	} else {
@@ -705,157 +611,158 @@ static int sc430ai_chg_mode(u32 id, struct ctl_sen_chgmode_obj obj)
 	return ret;
 }
 
-static int sc430ai_set_info(u32 id, u32 cfg_id, void *data)
+static ER sc430ai_set_info(CTL_SEN_ID id, CTL_SENDRV_CFGID cfg_id, void *data)
 {
-	if (id >= SEN_MAX_ID || !data)
+	if (id >= CTL_SEN_ID_MAX || !data)
 		return -EINVAL;
 
 	switch (cfg_id) {
-	case CFGID_SET_EXPT:
+	case CTL_SENDRV_CFGID_SET_EXPT:
 		return sc430ai_set_expt(id, data);
-	case CFGID_SET_GAIN:
+	case CTL_SENDRV_CFGID_SET_GAIN:
 		return sc430ai_set_gain(id, data);
-	case CFGID_FLIP_TYPE:
-		return sc430ai_set_flip(id, *(u32 *)data);
-	case CFGID_USER_DEFINE1:
+	case CTL_SENDRV_CFGID_FLIP_TYPE:
+		return sc430ai_set_flip(id, *(CTL_SEN_FLIP *)data);
+	case CTL_SENDRV_CFGID_USER_DEFINE1:
+		/* TODO: this is ISP_SENSOR_PRESET_CTRL, not our preset */
 		memcpy(&g_sen[id].preset, data, sizeof(g_sen[id].preset));
 		return 0;
 	default:
-		return SEN_E_NOSPT;
+		return E_NOSPT;
 	}
 }
 
-static int sc430ai_get_info(u32 id, u32 cfg_id, void *data)
+static ER sc430ai_get_info(CTL_SEN_ID id, CTL_SENDRV_CFGID cfg_id, void *data)
 {
 	u32 mode;
 
-	if (id >= SEN_MAX_ID || !data)
+	if (id >= CTL_SEN_ID_MAX || !data)
 		return -EINVAL;
 
 	switch (cfg_id) {
-	case CFGID_GET_EXPT: {
-		struct isp_sensor_ctrl *c = data;
+	case CTL_SENDRV_CFGID_GET_EXPT: {
+		ISP_SENSOR_CTRL *c = data;
 
 		c->exp_time[0] = g_sen[id].ctrl.exp_time[0];
 		c->exp_time[1] = g_sen[id].ctrl.exp_time[1];
 		return 0;
 	}
-	case CFGID_GET_GAIN: {
-		struct isp_sensor_ctrl *c = data;
+	case CTL_SENDRV_CFGID_GET_GAIN: {
+		ISP_SENSOR_CTRL *c = data;
 
 		c->gain_ratio[0] = g_sen[id].ctrl.gain_ratio[0];
 		c->gain_ratio[1] = g_sen[id].ctrl.gain_ratio[1];
 		return 0;
 	}
-	case CFGID_GET_ATTR_BASIC:
+	case CTL_SENDRV_CFGID_GET_ATTR_BASIC:
 		memcpy(data, &basic_param, sizeof(basic_param));
 		return 0;
-	case CFGID_GET_ATTR_SIGNAL:
-		memset(data, 0, 24);
+	case CTL_SENDRV_CFGID_GET_ATTR_SIGNAL:
+		memcpy(data, &signal_param, sizeof(signal_param));
 		return 0;
-	case CFGID_GET_ATTR_CMDIF: {
-		u8 *out = data;
+	case CTL_SENDRV_CFGID_GET_ATTR_CMDIF: {
+		CTL_SENDRV_GET_ATTR_CMDIF_PARAM *out = data;
 
-		*(u32 *)out = SEN_CMDIF_TYPE_I2C;
-		memcpy(out + 4, i2c_table_default, sizeof(i2c_table_default));
-		out[0x08] = (u8)g_sen[id].i2c.addr;
-		*(u32 *)(out + 0x34) = i2c_table_default[0];
-		out[0x38] = (u8)g_sen[id].i2c.addr;
-		*(u32 *)(out + 0x3c) = g_sen[id].i2c.id;
+		out->type = CTL_SEN_CMDIF_TYPE_I2C;
+		memcpy(&out->info.i2c, &i2c_table_default, sizeof(out->info.i2c));
+		out->info.i2c.w_addr_info[0].w_addr = g_sen[id].i2c.addr;
+		out->info.i2c.cur_w_addr_info.w_addr_sel = out->info.i2c.w_addr_info[0].w_addr_sel;
+		out->info.i2c.cur_w_addr_info.w_addr = g_sen[id].i2c.addr;
+		out->info.i2c.ch = g_sen[id].i2c.id;
 		return 0;
 	}
-	case CFGID_GET_ATTR_IF:
-		return (*(u32 *)data == SEN_IF_TYPE_MIPI) ? 0 : SEN_E_NOSPT;
-	case CFGID_GET_FPS: {
-		u32 *out = data;
+	case CTL_SENDRV_CFGID_GET_ATTR_IF:
+		return (((CTL_SENDRV_GET_ATTR_IF_PARAM *)data)->type == CTL_SEN_IF_TYPE_MIPI) ?
+		       0 : E_NOSPT;
+	case CTL_SENDRV_CFGID_GET_FPS: {
+		CTL_SENDRV_GET_FPS_PARAM *out = data;
 
-		out[0] = g_sen[id].cur_fps;
-		out[1] = g_sen[id].chg_fps;
+		out->chg_fps = g_sen[id].cur_fps;
+		out->cur_fps = g_sen[id].chg_fps;
 		return 0;
 	}
-	case CFGID_GET_MODE_SPEED: {
-		struct ctl_sen_speed_param *out = data;
+	case CTL_SENDRV_CFGID_GET_SPEED: {
+		CTL_SENDRV_GET_SPEED_PARAM *out = data;
 
 		mode = out->mode < SEN_MAX_MODE ? out->mode : 0;
 		*out = speed_param[mode];
-		if (g_sen[id].power.mclk <= 2)
-			out->mclksrc = g_sen[id].power.mclk + 1;
+		if (g_sen[id].power.mclk <= CTL_SEN_CLK_SEL_SIEMCLK3)
+			out->mclk_src = g_sen[id].power.mclk + CTL_SEN_SIEMCLK_SRC_MCLK;
 		else
-			out->mclksrc = g_sen[id].power.mclk;
+			out->mclk_src = g_sen[id].power.mclk;
 		return 0;
 	}
-	case CFGID_GET_MODESEL: {
-		u32 *p = data;
-		u32 fps = p[0], w = p[1], h = p[2], if_type = p[3], fmt = p[4], fnum = p[5];
+	case CTL_SENDRV_CFGID_GET_MODESEL: {
+		CTL_SENDRV_GET_MODESEL_PARAM *p = data;
+		u32 fps = p->frame_rate, w = p->size.w, h = p->size.h;
 
-		if (if_type != SEN_IF_TYPE_MIPI || fmt != SEN_DATA_FMT_RGB)
+		if (p->if_type != CTL_SEN_IF_TYPE_MIPI || p->data_fmt != CTL_SEN_DATA_FMT_RGB)
 			return 0;
-		if (fnum == 2 && w <= 2688 && h <= 1520 && fps <= 3000)
-			p[13] = 2; /* 2-frame Stagger HDR */
+		if (p->frame_num == 2 && w <= 2688 && h <= 1520 && fps <= 3000)
+			p->mode = CTL_SEN_MODE_3; /* 2-frame Stagger HDR */
 		else if (w <= 2688 && h <= 1520 && fps <= 3000)
-			p[13] = 0; /* 30fps linear */
+			p->mode = CTL_SEN_MODE_1; /* 30fps linear */
 		else if (w <= 2688 && h <= 1520 && fps <= 6000)
-			p[13] = 1; /* 60fps linear */
+			p->mode = CTL_SEN_MODE_2; /* 60fps linear */
 		else
-			p[13] = 0;
+			p->mode = CTL_SEN_MODE_1;
 		return 0;
 	}
-	case CFGID_GET_MODE_BASIC:
-		mode = *(u32 *)data;
+	case CTL_SENDRV_CFGID_GET_MODE_BASIC:
+		mode = *(CTL_SEN_MODE *)data;
 		if (mode >= SEN_MAX_MODE)
 			mode = 0;
 		memcpy(data, &mode_basic_param[mode], sizeof(mode_basic_param[0]));
 		return 0;
-	case CFGID_GET_MODE_MIPI:
-		mode = *(u32 *)data;
+	case CTL_SENDRV_CFGID_GET_MODE_MIPI:
+		mode = *(CTL_SEN_MODE *)data;
 		if (mode >= SEN_MAX_MODE)
 			mode = 0;
 		memcpy(data, &mipi_param[mode], sizeof(mipi_param[0]));
 		return 0;
-	case CFGID_GET_MIN_EXPT: {
-		/* HDAL 2022 ABI: out[1] is min exposure in 0.1 us (min_line * rowtime_10x), matching nvt_sen_sc401ai. */
-		u32 *out = data;
-		u32 rt, min_line;
+	case CTL_SENDRV_CFGID_GET_MODE_ROWTIME: {
+		CTL_SENDRV_GET_MODE_ROWTIME_PARAM *out = data;
+		u32 rt;
 
-		mode = out[0] < SEN_MAX_MODE ? out[0] : g_sen[id].cur_mode;
+		mode = out->mode < SEN_MAX_MODE ? out->mode : g_sen[id].cur_mode;
 		rt = sc430ai_calc_rowtime_10x(id, mode);
-		min_line = (mode_basic_param[mode].mode_type == SEN_MODE_LINEAR) ? 2 : 4;
-		out[2] = min_line;
-		out[1] = min_line * rt;
+		out->row_time_step = (mode_basic_param[mode].mode_type == CTL_SEN_MODE_LINEAR) ? 2 : 4;
+		out->row_time = out->row_time_step * rt;
 		return 0;
 	}
-	case CFGID_FLIP_TYPE: {
+	case CTL_SENDRV_CFGID_FLIP_TYPE: {
 		u8 val = 0;
-		u32 dir = 0;
+		u32 dir = CTL_SEN_FLIP_NONE;
 
 		if (sc430ai_i2c_read(id, 0x3221, &val) == 0) {
 			if (val & 0x06)
-				dir |= 1;
+				dir |= CTL_SEN_FLIP_H;
 			if (val & 0x60)
-				dir |= 2;
+				dir |= CTL_SEN_FLIP_V;
 		} else {
 			dir = g_sen[id].direction;
 		}
-		*(u32 *)data = dir;
+		*(CTL_SEN_FLIP *)data = dir;
 		return 0;
 	}
-	case CFGID_USER_DEFINE2:
+	case CTL_SENDRV_CFGID_USER_DEFINE2:
+		/* minimum exposure time, us */
 		*(u32 *)data = sc430ai_calc_rowtime_10x(id, g_sen[id].cur_mode) / 10U + 1;
 		return 0;
 	default:
-		return SEN_E_NOSPT;
+		return E_NOSPT;
 	}
 }
 
-static struct ctl_sen_drv_tab sc430ai_drv_tab = {
+static CTL_SEN_DRV_TAB sc430ai_drv_tab = {
 	.open = sc430ai_open,
 	.close = sc430ai_close,
 	.sleep = sc430ai_sleep,
 	.wakeup = sc430ai_wakeup,
-	.write_reg = sc430ai_write_reg,
-	.read_reg = sc430ai_read_reg,
-	.chg_mode = sc430ai_chg_mode,
-	.chg_fps = sc430ai_chg_fps,
+	.write = sc430ai_write_reg,
+	.read = sc430ai_read_reg,
+	.chgmode = sc430ai_chg_mode,
+	.chgfps = sc430ai_chg_fps,
 	.set_cfg = sc430ai_set_info,
 	.get_cfg = sc430ai_get_info,
 };
@@ -899,7 +806,7 @@ static void sc430ai_parse_cfg(const char *path)
 		*eq = '\0';
 		k = strim(line);
 		v = strim(eq + 1);
-		if (strncmp(k, "id_", 3) != 0 || k[3] < '0' || k[3] >= '0' + SEN_MAX_ID || k[4] != '_')
+		if (strncmp(k, "id_", 3) != 0 || k[3] < '0' || k[3] >= '0' + CTL_SEN_ID_MAX || k[4] != '_')
 			continue;
 		id = k[3] - '0';
 		k += 5;
@@ -921,9 +828,11 @@ static void sc430ai_parse_cfg(const char *path)
 		else if (!strcmp(k, "stable_time"))
 			g_sen[id].power.stable_time = val;
 		else if (!strcmp(k, "mirror"))
-			g_sen[id].direction = (g_sen[id].direction & ~1U) | (val ? 1U : 0U);
+			g_sen[id].direction = (g_sen[id].direction & ~CTL_SEN_FLIP_H) |
+					      (val ? CTL_SEN_FLIP_H : 0U);
 		else if (!strcmp(k, "flip"))
-			g_sen[id].direction = (g_sen[id].direction & ~2U) | (val ? 2U : 0U);
+			g_sen[id].direction = (g_sen[id].direction & ~CTL_SEN_FLIP_V) |
+					      (val ? CTL_SEN_FLIP_V : 0U);
 		else if (!strcmp(k, "expt_time"))
 			g_sen[id].preset.expt_time = val;
 		else if (!strcmp(k, "gain_ratio"))
@@ -934,19 +843,14 @@ static void sc430ai_parse_cfg(const char *path)
 
 static int __init sc430ai_init(void)
 {
-	struct ctl_sen_reg_sendrv reg = {
+	CTL_SEN_REG_OBJ reg = {
 		.pwr_ctrl = sc430ai_pwr_ctrl,
 		.det_plug_in = NULL,
 		.drv_tab = &sc430ai_drv_tab,
 	};
 	int i, ret;
 
-	BUILD_BUG_ON(sizeof(struct ctl_sen_mode_basic_param) != 0x94);
-	BUILD_BUG_ON(sizeof(struct ctl_sen_basic_param) != 0x30);
-	BUILD_BUG_ON(sizeof(struct ctl_sen_speed_param) != 0x14);
-	BUILD_BUG_ON(sizeof(struct ctl_sen_mipi_param) != 0x3c);
-
-	for (i = 0; i < SEN_MAX_ID; i++) {
+	for (i = 0; i < CTL_SEN_ID_MAX; i++) {
 		g_sen[i].cur_fps = 3000;
 		g_sen[i].chg_fps = 3000;
 		g_sen[i].compensation_gain[0] = 100;
@@ -954,8 +858,8 @@ static int __init sc430ai_init(void)
 		g_sen[i].preset.expt_time = 10000;
 		g_sen[i].preset.gain_ratio = 1000;
 		g_sen[i].preset.frame_rate = 3000;
-		g_sen[i].power.mclk = 0;
-		g_sen[i].power.pwdn_pin = 0xffffffffU;
+		g_sen[i].power.mclk = CTL_SEN_CLK_SEL_SIEMCLK;
+		g_sen[i].power.pwdn_pin = CTL_SEN_IGNORE;
 		g_sen[i].power.rst_pin = 0x41; /* S_GPIO_1 */
 		g_sen[i].power.rst_time = 1;
 		g_sen[i].power.stable_time = 1;
@@ -979,7 +883,7 @@ static void __exit sc430ai_exit(void)
 	int i;
 
 	ctl_sen_unreg_sendrv("nvt_sen_sc430ai");
-	for (i = 0; i < SEN_MAX_ID; i++)
+	for (i = 0; i < CTL_SEN_ID_MAX; i++)
 		sc430ai_close(i);
 }
 

@@ -1,1 +1,8 @@
+# A self-contained driver: it does not use ../common, so it does not go
+# through sensor.kbuild, but builds the same nvt_sen_<model>.ko.
+NA51089_INC := $(src)/../../../../kernel/include/na51089
+
+ccflags-y += -D__LINUX -Wno-date-time -I$(NA51089_INC)
+
 obj-m := nvt_sen_sc430ai.o
+nvt_sen_sc430ai-objs := sen_sc430ai.o
