@@ -151,6 +151,13 @@ Changes since that PR (commit b1ba5dc is the PR verbatim):
   and gain. Presets now follow the SDK drivers.
 - The MCLK callback got the sensor id instead of the configured clock;
   `GET_FPS` swapped its two fields.
+- Mode selection checks frame count, lanes, pixel depth and mode type
+  against each mode and fails a request no mode meets; a 2-frame request
+  at 60 fps got the linear 60 fps mode.
+- A `sen_cfg_path` that cannot be read fails the load instead of falling
+  back to the built-in wiring. A mode change stops at the first failed
+  write rather than going on to stream on. Frame rates below what the
+  frame-length register reaches report the rate it gives.
 
 ## Changes against the SDK
 

@@ -248,8 +248,11 @@ static u32 sc430ai_calc_vd(u32 id, u32 fps)
 	vd = (dft_fps * dft_vd) / fps;
 	if (vd < dft_vd)
 		vd = dft_vd;
-	if (vd > 0x7fff)
+	if (vd > 0x7fff) {
+		/* Report the rate the clamped frame length gives. */
 		vd = 0x7fff;
+		fps = (dft_fps * dft_vd) / vd;
+	}
 	g_sen[id].cur_fps = fps;
 	return vd;
 }
@@ -323,8 +326,10 @@ static int sc430ai_set_expt(u32 id, const ISP_SENSOR_CTRL *ctrl)
 	vd = (mb->dft_fps * mb->signal_info.vd_period) / fps;
 	if (vd < mb->signal_info.vd_period)
 		vd = mb->signal_info.vd_period;
-	if (vd > 0x7fff)
+	if (vd > 0x7fff) {
 		vd = 0x7fff;
+		fps = (mb->dft_fps * mb->signal_info.vd_period) / vd;
+	}
 	g_sen[id].cur_fps = fps;
 
 	ret = sc430ai_i2c_write(id, 0x320e, (vd >> 8) & 0x7f);
@@ -622,20 +627,28 @@ static ER sc430ai_chg_mode(CTL_SEN_ID id, CTL_SENDRV_CHGMODE_OBJ obj)
 		n = ARRAY_SIZE(sc430ai_mode_1);
 	}
 
-	for (i = 0; i < n; i++) {
+	/* Stop at the first failure: the table ends with stream on (0x0100),
+	 * which must not follow a partly applied setup. */
+	for (i = 0; i < n && !ret; i++) {
 		if (tbl[i].addr == SEN_CMD_DELAY) {
 			msleep(tbl[i].val);
 		} else if (tbl[i].addr == SEN_CMD_SETVD) {
-			ret |= sc430ai_chg_fps(id, g_sen[id].chg_fps);
+			ret = sc430ai_chg_fps(id, g_sen[id].chg_fps);
 		} else if (tbl[i].addr == SEN_CMD_PRESET) {
 			sc430ai_get_preset(id, &ctrl);
-			ret |= sc430ai_set_expt(id, &ctrl);
-			ret |= sc430ai_set_gain(id, &ctrl);
+			ret = sc430ai_set_expt(id, &ctrl);
+			if (!ret)
+				ret = sc430ai_set_gain(id, &ctrl);
 		} else if (tbl[i].addr == SEN_CMD_DIRECTION) {
-			ret |= sc430ai_set_flip(id, g_sen[id].direction);
+			ret = sc430ai_set_flip(id, g_sen[id].direction);
 		} else {
-			ret |= sc430ai_i2c_write(id, (u16)tbl[i].addr, tbl[i].val);
+			ret = sc430ai_i2c_write(id, (u16)tbl[i].addr, tbl[i].val);
 		}
+	}
+	if (ret) {
+		pr_err("nvt_sen_sc430ai: mode %u setup failed at entry %zu (%d)\n",
+		       obj.mode, i - 1, ret);
+		return ret;
 	}
 
 	/* A later mode change keeps the exposure AE has reached by then. */
@@ -725,20 +738,40 @@ static ER sc430ai_get_info(CTL_SEN_ID id, CTL_SENDRV_CFGID cfg_id, void *data)
 		return 0;
 	}
 	case CTL_SENDRV_CFGID_GET_MODESEL: {
+		/* Slowest mode first, so 30fps requests get the 30fps tables. */
+		static const CTL_SEN_MODE order[] = {
+			CTL_SEN_MODE_1, CTL_SEN_MODE_3, CTL_SEN_MODE_2,
+		};
 		CTL_SENDRV_GET_MODESEL_PARAM *p = data;
-		u32 fps = p->frame_rate, w = p->size.w, h = p->size.h;
+		u32 frames = p->frame_num;
+		size_t k;
 
-		if (p->if_type != CTL_SEN_IF_TYPE_MIPI || p->data_fmt != CTL_SEN_DATA_FMT_RGB)
+		/* 0 and CTL_SEN_IGNORE leave a field to the driver. */
+		if (!frames || frames == CTL_SEN_IGNORE)
+			frames = 1;
+		for (k = 0; k < ARRAY_SIZE(order); k++) {
+			const CTL_SENDRV_GET_MODE_BASIC_PARAM *mb = &mode_basic_param[order[k]];
+
+			if (p->if_type != mb->if_type || p->data_fmt != mb->data_fmt ||
+			    p->size.w > mb->crp_size.w || p->size.h > mb->crp_size.h ||
+			    p->frame_rate > mb->dft_fps || frames != mb->frame_num)
+				continue;
+			if (p->pixdepth && p->pixdepth != CTL_SEN_IGNORE &&
+			    p->pixdepth != mb->pixel_depth)
+				continue;
+			if (p->mode_type_sel && p->mode_type_sel != CTL_SEN_IGNORE &&
+			    p->mode_type_sel != mb->mode_type)
+				continue;
+			if (p->data_lane && p->data_lane != CTL_SEN_IGNORE &&
+			    p->data_lane != mipi_param[order[k]].data_lane)
+				continue;
+			p->mode = order[k];
 			return 0;
-		if (p->frame_num == 2 && w <= 2688 && h <= 1520 && fps <= 3000)
-			p->mode = CTL_SEN_MODE_3; /* 2-frame Stagger HDR */
-		else if (w <= 2688 && h <= 1520 && fps <= 3000)
-			p->mode = CTL_SEN_MODE_1; /* 30fps linear */
-		else if (w <= 2688 && h <= 1520 && fps <= 6000)
-			p->mode = CTL_SEN_MODE_2; /* 60fps linear */
-		else
-			p->mode = CTL_SEN_MODE_1;
-		return 0;
+		}
+		pr_err("nvt_sen_sc430ai: no mode for %ux%u@%u frames %u lanes %u type %u\n",
+		       p->size.w, p->size.h, p->frame_rate, p->frame_num,
+		       p->data_lane, p->mode_type_sel);
+		return -EINVAL;
 	}
 	case CTL_SENDRV_CFGID_GET_MODE_BASIC:
 		mode = *(CTL_SEN_MODE *)data;
@@ -799,7 +832,9 @@ static CTL_SEN_DRV_TAB sc430ai_drv_tab = {
 	.get_cfg = sc430ai_get_info,
 };
 
-static void sc430ai_parse_cfg(const char *path)
+/* An unreadable cfg fails the load: falling back to the built-in wiring
+ * would drive another board's reset GPIO and I2C bus. */
+static int sc430ai_parse_cfg(const char *path)
 {
 	struct file *f;
 	char *buf, *p, *line;
@@ -807,20 +842,23 @@ static void sc430ai_parse_cfg(const char *path)
 	ssize_t len;
 
 	if (!path || !path[0] || !strcmp(path, "null") || !strcmp(path, "NULL"))
-		return;
+		return 0;
 	f = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(f))
-		return;
+	if (IS_ERR(f)) {
+		pr_err("nvt_sen_sc430ai: cannot open %s (%ld)\n", path, PTR_ERR(f));
+		return PTR_ERR(f);
+	}
 	buf = kzalloc(4096, GFP_KERNEL);
 	if (!buf) {
 		filp_close(f, NULL);
-		return;
+		return -ENOMEM;
 	}
 	len = kernel_read(f, buf, 4095, &pos);
 	filp_close(f, NULL);
 	if (len <= 0) {
+		pr_err("nvt_sen_sc430ai: cannot read %s (%zd)\n", path, len);
 		kfree(buf);
-		return;
+		return len ? (int)len : -EINVAL;
 	}
 
 	p = buf;
@@ -871,6 +909,7 @@ static void sc430ai_parse_cfg(const char *path)
 			g_sen[id].preset.gain_ratio = val;
 	}
 	kfree(buf);
+	return 0;
 }
 
 static int __init sc430ai_init(void)
@@ -898,7 +937,9 @@ static int __init sc430ai_init(void)
 		g_sen[i].i2c.addr = 0x30;
 	}
 
-	sc430ai_parse_cfg(sen_cfg_path);
+	ret = sc430ai_parse_cfg(sen_cfg_path);
+	if (ret)
+		return ret;
 
 	ret = ctl_sen_reg_sendrv("nvt_sen_sc430ai", &reg);
 	if (ret)
